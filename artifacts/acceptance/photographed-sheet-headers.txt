@@ -1,0 +1,15 @@
+HTTP/1.1 200 OK
+date: Mon, 05 Oct 2026 04:27:23 GMT
+server: uvicorn
+content-disposition: attachment; filename="masked-aadhaar.pdf"
+x-aadhaar-documents: 1
+x-redacted-regions: 3
+x-document-classes: aadhaar_letter
+x-document-confidence: 0.936
+x-verification-confidence: 0.888
+cache-control: no-store, private
+pragma: no-cache
+x-content-type-options: nosniff
+content-length: 2702973
+content-type: application/pdf
+

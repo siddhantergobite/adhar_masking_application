@@ -1,0 +1,12 @@
+# Run training commands from the repository root. Polygon labels use:
+# <class> <x1> <y1> <x2> <y2> ... with coordinates normalized to [0, 1].
+path: datasets/aadhaar-document-seg
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: aadhaar_front
+  1: aadhaar_back
+  2: aadhaar_letter
+

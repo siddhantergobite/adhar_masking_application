@@ -1,0 +1,10 @@
+# Run training commands from the repository root. Box labels use:
+# <class> <x_center> <y_center> <width> <height>, normalized to [0, 1].
+path: datasets/aadhaar-number
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: aadhaar_number
+

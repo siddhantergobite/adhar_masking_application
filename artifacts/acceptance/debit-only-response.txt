@@ -1,0 +1,1 @@
+{"detail":{"code":"no_aadhaar_detected","message":"No Aadhaar document was detected. Nothing was changed.","action":"Upload an Aadhaar card or Aadhaar letter with its full boundary visible."}}
