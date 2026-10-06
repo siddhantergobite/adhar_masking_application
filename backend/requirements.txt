@@ -1,0 +1,14 @@
+fastapi==0.120.2
+uvicorn==0.38.0
+python-multipart==0.0.20
+numpy==1.26.4
+opencv-python==4.10.0.84
+Pillow==11.3.0
+paddlepaddle==3.2.2
+paddleocr==3.7.0
+pypdfium2==4.30.0
+reportlab==4.4.4
+pillow-heif==0.18.0
+torch==2.8.0
+torchvision==0.23.0
+ultralytics==8.4.172
