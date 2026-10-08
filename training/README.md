@@ -1,6 +1,12 @@
-# Training the production models
+# Training and evaluating the Aadhaar models
 
-The runtime is complete but deliberately refuses to process documents until two task-specific, reviewed weights are present. A generic rectangle detector or an OCR-only rule would recreate the debit-card false-positive problem.
+## Current checkpoint status
+
+This workspace currently contains both runtime checkpoint files under `backend/models/`. They are **synthetic bootstrap weights**, not production-approved weights. The document checkpoint is 6.20 MiB and the number checkpoint is 5.10 MiB. They were fine-tuned from Ultralytics YOLO26 nano COCO-pretrained starters using generated examples; no real Aadhaar document was used for model training. The API can load them for local development, but their presence does not establish production accuracy. Git ignores `backend/models/*.pt`, so a fresh checkout does not include these custom weights; deliver them separately or retrain before expecting the API to become ready.
+
+See [CTO_APPLICATION_GUIDE.md](../CTO_APPLICATION_GUIDE.md) for the official base-model source, initial failed experiments, the recorded fine-tuning recipes, file hashes and sizes, measured CPU training time, and client-facing answers. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the pipeline and summarized evaluation results.
+
+The runtime requires two task-specific checkpoints with the expected class names. A generic rectangle detector or an OCR-only rule would recreate the debit-card false-positive problem. Release weights must be trained and evaluated against a consented, identity-disjoint real-world dataset.
 
 ## 1. Build the datasets
 

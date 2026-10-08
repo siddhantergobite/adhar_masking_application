@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Component, useEffect, useRef, useState } from 'react';
 import DOMPurify from 'dompurify';
 
 let pdfjsPromise;
@@ -32,10 +32,12 @@ function Icon({ name, size = 20 }) {
 }
 
 function fileKind(file) {
+  if (!file || typeof file.name !== 'string') return 'unsupported';
+  const mimeType = typeof file.type === 'string' ? file.type : '';
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-  if (file.type.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff', 'gif', 'heic', 'heif'].includes(ext)) return 'image';
-  if (file.type === 'application/pdf' || ext === 'pdf') return 'pdf';
-  if (ext === 'docx' || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return 'docx';
+  if (mimeType.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff', 'gif', 'heic', 'heif'].includes(ext)) return 'image';
+  if (mimeType === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return 'docx';
   if (ext === 'doc') return 'doc';
   return 'unsupported';
 }
@@ -49,14 +51,35 @@ function LoadingPreview({ label = 'Preparing your local preview…' }) {
   return <div className="preview-empty"><div className="loader-ring"/><span>{label}</span></div>;
 }
 
-function UnsupportedPreview({ message }) {
+function UnsupportedPreview({ message, title = 'Preview unavailable' }) {
   return (
     <div className="unsupported-preview">
       <span className="unsupported-icon"><Icon name="file" size={24}/></span>
-      <h4>Preview unavailable</h4>
+      <h4>{title}</h4>
       <p>{message}</p>
     </div>
   );
+}
+
+class DisplayErrorBoundary extends Component {
+  state = { error: null };
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error('Document preview failed:', error);
+  }
+
+  render() {
+    if (this.state.error) {
+      const message = this.props.message || 'This preview could not be displayed. Switch preview mode or upload the file again.';
+      const details = import.meta.env.DEV && this.state.error.message ? ` Details: ${this.state.error.message}` : '';
+      return <UnsupportedPreview title={this.props.title} message={`${message}${details}`}/>;
+    }
+    return this.props.children;
+  }
 }
 
 function DocumentPreview({ file, kind }) {
@@ -70,11 +93,18 @@ function DocumentPreview({ file, kind }) {
 
   useEffect(() => {
     if (kind !== 'image') return undefined;
-    const url = URL.createObjectURL(file);
-    setImageUrl(url);
-    setLoading(true);
-    setError('');
-    return () => URL.revokeObjectURL(url);
+    try {
+      const url = URL.createObjectURL(file);
+      setImageUrl(url);
+      setLoading(true);
+      setError('');
+      return () => URL.revokeObjectURL(url);
+    } catch (cause) {
+      setImageUrl(null);
+      setLoading(false);
+      setError(cause.message || 'We could not open this image. Please upload it again.');
+      return undefined;
+    }
   }, [file, kind]);
 
   useEffect(() => {
@@ -222,7 +252,8 @@ function App() {
   const [showMasked, setShowMasked] = useState(false);
   const fileInputRef = useRef(null);
   const processAbortRef = useRef(null);
-  const previewFile = showMasked && maskedFile ? maskedFile : file;
+  const previewMode = showMasked && maskedFile ? 'masked' : 'original';
+  const previewFile = previewMode === 'masked' ? maskedFile : file;
   const kind = previewFile ? fileKind(previewFile) : null;
 
   useEffect(() => {
@@ -431,12 +462,16 @@ function App() {
                 <div className="document-file"><span className="document-type-icon"><Icon name="file" size={18}/></span><div><strong title={previewFile.name}>{previewFile.name}</strong><span>{kind.toUpperCase()} · {humanSize(previewFile.size)}</span></div></div>
                 <div className="document-toolbar-right">
                   {maskedFile && <div className="result-tabs"><button className={!showMasked ? 'selected' : ''} type="button" onClick={() => setShowMasked(false)}>Original</button><button className={showMasked ? 'selected' : ''} type="button" onClick={() => setShowMasked(true)}>Masked result</button></div>}
-                  <span className="local-status"><span className="status-dot"/>{showMasked ? 'Redacted copy' : 'Local preview'}</span>
+                  <span className="local-status"><span className="status-dot"/>{previewMode === 'masked' ? 'Redacted copy' : 'Local preview'}</span>
                   <button className="icon-button" type="button" onClick={resetFile} aria-label="Remove document"><Icon name="close" size={19}/></button>
                 </div>
               </div>
               <div className="document-body">
-                <div className="preview-panel"><DocumentPreview key={`${previewFile.name}-${previewFile.lastModified}`} file={previewFile} kind={kind}/></div>
+                <div className="preview-panel">
+                  <DisplayErrorBoundary key={`${previewFile.name}-${previewFile.size}-${previewFile.lastModified}-${previewMode}`}>
+                    <DocumentPreview file={previewFile} kind={kind}/>
+                  </DisplayErrorBoundary>
+                </div>
                 <aside className="process-panel">
                   <div className="process-kicker">YOUR DOCUMENT</div>
                   <h3>{maskedFile ? 'Your verified masked copy is ready' : 'Ready to detect Aadhaar only'}</h3>
@@ -490,4 +525,4 @@ function App() {
 }
 
 export default App;
-export { DocumentPreview, fileKind, humanSize, Icon };
+export { DisplayErrorBoundary, DocumentPreview, fileKind, humanSize, Icon };

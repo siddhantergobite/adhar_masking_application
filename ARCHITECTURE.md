@@ -318,6 +318,7 @@ Files:
 - `training/aadhaar-document-seg.yaml`
 - `training/aadhaar-number.yaml`
 - `training/README.md`
+- `CTO_APPLICATION_GUIDE.md` - pretrained model provenance, training history, checkpoint sizes, timing, and client Q&A
 
 ### Document segmentation annotations
 

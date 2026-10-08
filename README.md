@@ -4,7 +4,7 @@ A React single-page application and private FastAPI computer-vision service for 
 
 The application is intentionally fail-closed. It does not OCR the whole upload and mask arbitrary 12-digit strings.
 
-For the complete system design, component responsibilities, model rationale, measured results, security controls, limitations, and CTO review questions, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For the system design and measured results, see [ARCHITECTURE.md](ARCHITECTURE.md). For model provenance, training history, checkpoint sizes, timing, and client questions, see [CTO_APPLICATION_GUIDE.md](CTO_APPLICATION_GUIDE.md).
 
 ## Processing pipeline
 
@@ -27,14 +27,14 @@ Expected behavior:
 
 ## Required model weights
 
-The API requires both files below and will report `models_missing` until they exist:
+The API requires both files below and will report `models_missing` if either is absent or has an incompatible class contract:
 
 ```text
 backend/models/aadhaar-document-seg.pt
 backend/models/aadhaar-number-det.pt
 ```
 
-Weights are not fabricated or bundled from public identity documents. Follow [training/README.md](training/README.md) to annotate hard negatives, audit the datasets, train both models and run the release evaluation. The public five-class entity dataset discussed during development is not an outer-boundary segmentation dataset and is therefore not accepted as the document model.
+Both files are present in this working folder as synthetic bootstrap checkpoints. They are fine-tuned from official Ultralytics YOLO26 COCO-pretrained weights using generated examples, not real Aadhaar records. They allow local prototype/regression work but are not production-certified. The custom `.pt` files are ignored by Git, so a fresh checkout needs the model artifacts delivered separately or trained before the API becomes ready. Follow [training/README.md](training/README.md) to prepare consented real data and run a release evaluation. The public five-class entity dataset discussed during development is not an outer-boundary segmentation dataset and was not used to create these checkpoints.
 
 ## Install on Windows
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { DocumentPreview, fileKind, humanSize, Icon } from './App.jsx';
+import { DisplayErrorBoundary, DocumentPreview, fileKind, humanSize, Icon } from './App.jsx';
 
 const PROCESS_TIMEOUT_MS = 90_000;
 const FILE_ACCEPT = 'image/*,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.heic,.heif,.pdf,.doc,.docx';
@@ -34,8 +34,12 @@ function statusLabel(item) {
 }
 
 function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult }) {
-  const previewFile = item.showMasked && item.maskedFile ? item.maskedFile : item.file;
-  const kind = fileKind(previewFile);
+  // Accept both property names so uploads survive Vite hot reloads across the
+  // earlier state shape change.
+  const originalFile = item.originalFile ?? item.file;
+  const previewMode = item.showMasked && item.maskedFile ? 'masked' : 'original';
+  const originalKind = originalFile ? fileKind(originalFile) : 'unsupported';
+  const maskedKind = item.maskedFile ? fileKind(item.maskedFile) : null;
   const hasResult = Boolean(item.maskedFile && item.maskedUrl);
 
   return (
@@ -45,23 +49,34 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
           <span className="document-index">{String(index + 1).padStart(2, '0')}</span>
           <span className="document-type-icon"><Icon name="file" size={18}/></span>
           <div>
-            <strong title={item.file.name}>{item.file.name}</strong>
-            <span>{fileKind(item.file).toUpperCase()} &middot; {humanSize(item.file.size)}</span>
+            <strong title={originalFile?.name || 'Uploaded file'}>{originalFile?.name || 'Uploaded file'}</strong>
+            <span>{fileKind(originalFile).toUpperCase()} &middot; {humanSize(originalFile?.size || 0)}</span>
           </div>
         </div>
-        <button className="icon-button" type="button" onClick={() => onRemove(item.id)} aria-label={`Remove ${item.file.name}`}>
+        <button className="icon-button" type="button" onClick={() => onRemove(item.id)} aria-label={`Remove ${originalFile?.name || 'uploaded file'}`}>
           <Icon name="close" size={17}/>
         </button>
       </div>
 
       <div className="document-card-preview">
-        <DocumentPreview key={`${previewFile.name}-${previewFile.lastModified}-${item.showMasked}`} file={previewFile} kind={kind}/>
+        <div className="document-preview-slot" hidden={previewMode !== 'original'}>
+          <DisplayErrorBoundary key={`${item.id}-original`}>
+            <DocumentPreview file={originalFile} kind={originalKind}/>
+          </DisplayErrorBoundary>
+        </div>
+        {item.maskedFile && (
+          <div className="document-preview-slot" hidden={previewMode !== 'masked'}>
+            <DisplayErrorBoundary key={`${item.id}-masked`}>
+              <DocumentPreview file={item.maskedFile} kind={maskedKind}/>
+            </DisplayErrorBoundary>
+          </div>
+        )}
       </div>
 
       <div className="document-card-footer">
         <div className="document-card-meta">
           {hasResult && (
-            <div className="result-tabs" role="tablist" aria-label={`Preview mode for ${item.file.name}`}>
+            <div className="result-tabs" role="tablist" aria-label={`Preview mode for ${originalFile?.name || 'uploaded file'}`}>
               <button className={!item.showMasked ? 'selected' : ''} type="button" role="tab" aria-selected={!item.showMasked} onClick={() => onToggleResult(item.id, false)}>Original</button>
               <button className={item.showMasked ? 'selected' : ''} type="button" role="tab" aria-selected={item.showMasked} onClick={() => onToggleResult(item.id, true)}>Masked result</button>
             </div>
@@ -71,7 +86,7 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
 
         {item.status === 'done' ? (
           <div className="document-card-result">
-            <p>{item.documentCount} Aadhaar document{item.documentCount === 1 ? '' : 's'} isolated; {item.maskedCount} number line{item.maskedCount === 1 ? '' : 's'} redacted.{item.documentClasses.length ? ` Detected: ${item.documentClasses.map((name) => name.replaceAll('_', ' ')).join(', ')}.` : ''}</p>
+            <p>{item.documentCount} Aadhaar document{item.documentCount === 1 ? '' : 's'} isolated; {item.maskedCount} number line{item.maskedCount === 1 ? '' : 's'} redacted.{item.documentClasses?.length ? ` Detected: ${item.documentClasses.map((name) => name.replaceAll('_', ' ')).join(', ')}.` : ''}</p>
             <a className="download-result-button" href={item.maskedUrl} download={item.maskedFile.name}>Download masked PDF <Icon name="arrow" size={14}/></a>
           </div>
         ) : item.status === 'error' ? (
@@ -200,6 +215,16 @@ function BatchApp() {
   async function processFile(item) {
     if (!item || engineStatus !== 'ready' || processingIdRef.current) return;
 
+    const originalFile = item.originalFile ?? item.file;
+    if (!originalFile) {
+      setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
+        ...candidate,
+        status: 'error',
+        error: 'The original upload is no longer available. Please upload this file again.',
+      } : candidate));
+      return;
+    }
+
     const controller = new AbortController();
     let timedOut = false;
     const timeoutId = window.setTimeout(() => {
@@ -213,7 +238,7 @@ function BatchApp() {
 
     try {
       const body = new FormData();
-      body.append('file', item.file);
+      body.append('file', originalFile);
       const response = await fetch('/api/process', { method: 'POST', body, signal: controller.signal });
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
@@ -232,7 +257,7 @@ function BatchApp() {
         return;
       }
 
-      const safeName = item.file.name.replace(/\.[^.]+$/, '');
+      const safeName = originalFile.name.replace(/\.[^.]+$/, '');
       const maskedFile = new File([blob], `${safeName}-masked.pdf`, { type: 'application/pdf' });
       setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
         ...candidate,
