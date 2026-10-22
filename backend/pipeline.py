@@ -161,7 +161,14 @@ class AadhaarPipeline:
                     broader_result = None
                 if (
                     broader_result is not None
-                    and broader_result.masked_regions > page_results[0].masked_regions
+                    and (
+                        broader_result.masked_regions > page_results[0].masked_regions
+                        or (
+                            broader_result.masked_regions == page_results[0].masked_regions
+                            and page_has_aadhaar_back_without_number
+                            and self._detections_tile_page(primary_detections, page.shape)
+                        )
+                    )
                 ):
                     page_results = [broader_result]
 
@@ -216,6 +223,64 @@ class AadhaarPipeline:
                 continue
             accepted.append(candidate)
         return sorted(accepted, key=lambda item: (float(item.box[1]), float(item.box[0])))
+
+    @staticmethod
+    def _detections_tile_page(
+        detections: list[VisionDetection],
+        image_shape: tuple[int, ...],
+    ) -> bool:
+        """Identify aligned Aadhaar panels that together fill one upload.
+
+        A two-sided Aadhaar may be photographed as front-over-back. When the
+        detector returns one box per panel, the full-page OCR crop can retain
+        both sides even if it finds the same number of redaction lines as the
+        lower panel crop. This exception only applies when confident YOLO
+        boxes are adjacent, horizontally aligned, and span almost the page.
+        """
+
+        candidates = [item for item in detections if item.confidence >= 0.50]
+        if len(candidates) < 2:
+            return False
+
+        image_height, image_width = image_shape[:2]
+        ordered = sorted(candidates, key=lambda item: (float(item.box[1]), float(item.box[0])))
+        left = min(float(item.box[0]) for item in ordered)
+        top = min(float(item.box[1]) for item in ordered)
+        right = max(float(item.box[2]) for item in ordered)
+        bottom = max(float(item.box[3]) for item in ordered)
+        union_width = max(0.0, right - left)
+        union_height = max(0.0, bottom - top)
+        page_area = max(1.0, float(image_width * image_height))
+        if union_width * union_height / page_area < 0.86:
+            return False
+        if (
+            left > image_width * 0.08
+            or top > image_height * 0.08
+            or image_width - right > image_width * 0.08
+            or image_height - bottom > image_height * 0.08
+        ):
+            return False
+
+        for first, second in zip(ordered, ordered[1:]):
+            first_width = max(1.0, float(first.box[2] - first.box[0]))
+            second_width = max(1.0, float(second.box[2] - second.box[0]))
+            horizontal_overlap = max(
+                0.0,
+                min(float(first.box[2]), float(second.box[2]))
+                - max(float(first.box[0]), float(second.box[0])),
+            )
+            aligned = horizontal_overlap / min(first_width, second_width) >= 0.65
+            min_height = max(
+                1.0,
+                min(
+                    float(first.box[3] - first.box[1]),
+                    float(second.box[3] - second.box[1]),
+                ),
+            )
+            vertical_gap = max(0.0, float(second.box[1] - first.box[3]))
+            if not aligned or vertical_gap > min_height * 0.12:
+                return False
+        return True
 
     @staticmethod
     def _refine_document_boundaries(
