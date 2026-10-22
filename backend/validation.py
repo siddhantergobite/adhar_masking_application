@@ -35,6 +35,20 @@ _P_TABLE = (
 
 _INVERSE = (0, 4, 3, 2, 1, 5, 6, 7, 8, 9)
 _SEPARATORS = frozenset(" \t\r\n-\u2010\u2011\u2012\u2013\u2014")
+_AADHAAR_IDENTITY_PHRASES = (
+    "aadhaar",
+    "aadhar",
+    "uidai",
+    "unique identification authority",
+    "\u0906\u0927\u093e\u0930",
+    "\u092f\u0942\u0906\u0908\u0921\u0940\u090f\u0906\u0908",
+)
+_PAN_IDENTITY_PHRASES = (
+    "permanent account number",
+    "income tax department",
+    "pan card",
+    "form 49a",
+)
 
 
 def verhoeff_is_valid(number: str) -> bool:
@@ -89,6 +103,18 @@ def _normalise_text(lines: list[OcrLine]) -> str:
     return text
 
 
+def has_aadhaar_identity_anchor(lines: list[OcrLine]) -> bool:
+    """Require Aadhaar-specific text; a government heading or QR is generic."""
+    text = _normalise_text(lines)
+    return any(phrase in text for phrase in _AADHAAR_IDENTITY_PHRASES)
+
+
+def has_pan_identity_anchor(lines: list[OcrLine]) -> bool:
+    """Recognize common PAN-card headings as negative Aadhaar evidence."""
+    text = _normalise_text(lines)
+    return any(phrase in text for phrase in _PAN_IDENTITY_PHRASES)
+
+
 def qr_present(image_rgb: np.ndarray) -> bool:
     detector = cv2.QRCodeDetector()
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
@@ -120,8 +146,8 @@ def verify_aadhaar(
         "uidai": 0.20,
         "unique identification authority": 0.20,
         "government of india": 0.16,
-        "भारत सरकार": 0.16,
-        "आधार": 0.20,
+        "\u092d\u093e\u0930\u0924 \u0938\u0930\u0915\u093e\u0930": 0.16,
+        "\u0906\u0927\u093e\u0930": 0.20,
     }
     secondary_phrases = {
         "year of birth",
@@ -165,9 +191,16 @@ def verify_aadhaar(
         score += 0.10 if has_qr else 0.0
         score += 0.12 if valid_number_count else 0.0
         score = min(score, 1.0)
-        has_identity_anchor = bool(strong_weight or has_qr)
+        # English OCR often misses the Hindi Aadhaar label in phone photos.
+        # A checksum-valid 12-digit line plus a government heading or QR is
+        # enough corroboration for a YOLO Aadhaar-class proposal. Explicit PAN
+        # markers are filtered upstream.
         exceptional_model_and_number = detector_confidence >= 0.90 and valid_number_count > 0
-        accepted = score >= threshold and (has_identity_anchor or exceptional_model_and_number)
+        accepted = (
+            score >= threshold
+            and valid_number_count > 0
+            and (strong_weight > 0 or has_qr or exceptional_model_and_number)
+        )
     else:
         # OpenCV proposes geometry only; it receives no Aadhaar identity
         # credit. Acceptance requires mutually independent content signals.

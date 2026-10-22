@@ -43,7 +43,7 @@ class VerhoeffTests(unittest.TestCase):
     def test_opencv_fallback_requires_checksum_identity_and_layout(self) -> None:
         lines = [
             OcrLine(
-                text="Government of India",
+                text="Government of India Aadhaar",
                 confidence=0.98,
                 polygon=np.array([[0, 0], [100, 0], [100, 20], [0, 20]], dtype=np.float32),
             ),

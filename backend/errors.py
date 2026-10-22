@@ -29,8 +29,8 @@ class ModelNotReady(PipelineError):
 
 class NoAadhaarDetected(PipelineError):
     code = "no_aadhaar_detected"
-    public_message = "No Aadhaar document was detected. Nothing was changed."
-    action = "Upload an Aadhaar card or Aadhaar letter with its full boundary visible."
+    public_message = "No Aadhaar document was found in this upload. Nothing was changed."
+    action = "Upload a clear Aadhaar card or letter with its full boundary visible."
 
 
 class UnsafeDocument(PipelineError):

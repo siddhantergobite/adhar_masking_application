@@ -19,7 +19,17 @@ from .geometry import (
 from .ocr import read_ocr_lines
 from .redaction import mask_first_eight
 from .settings import Settings
-from .validation import extract_aadhaar_digits, qr_present, verify_aadhaar
+from .validation import (
+    extract_aadhaar_digits,
+    has_aadhaar_identity_anchor,
+    has_pan_identity_anchor,
+    qr_present,
+    verify_aadhaar,
+)
+
+
+class _NotAadhaarCandidate(Exception):
+    """Internal signal for a card-shaped object without Aadhaar identity text."""
 
 
 class AadhaarPipeline:
@@ -75,34 +85,31 @@ class AadhaarPipeline:
             )
 
             # A model box can be valid Aadhaar identity evidence while still
-            # clipping the physical page.  Treat the complete image as a
-            # last-chance candidate, after the learned/geometric candidates,
-            # so readable full-card photos are not rejected just because the
-            # outer boundary detector missed an edge.  It can only produce an
-            # output after the same OCR, checksum, identity and post-mask
-            # checks as every other candidate.
-            had_primary_candidates = bool(detections)
+            # clipping the physical page. Treat the complete image as a
+            # last-chance candidate, after the learned/geometric candidates.
             page_results: list[ProcessedDocument] = []
             page_failures: list[UnsafeDocument | NoAadhaarNumber] = []
+            page_has_aadhaar_back_without_number = False
             for detection in detections:
                 try:
                     result = self._process_detection(page, detection)
                     if result is not None:
                         page_results.append(result)
+                    elif detection.class_name == "aadhaar_back":
+                        page_has_aadhaar_back_without_number = True
+                except _NotAadhaarCandidate:
+                    # A card-shaped PAN or other document is not an Aadhaar
+                    # failure. Ignore it so the final message says no Aadhaar
+                    # was found when no Aadhaar candidate passes OCR checks.
+                    continue
                 except NoAadhaarNumber as exc:
-                    # A geometric proposal is not an Aadhaar claim. Ordinary
-                    # rectangles without verified Aadhaar content are ignored.
-                    # Low-confidence fallback detections are hypotheses. They
-                    # commonly include a nearby debit card after a real
-                    # Aadhaar has already been verified, so they must not veto
-                    # the bounded result or trigger a full-frame rescue.
+                    # _process_detection raises this only after OCR finds
+                    # Aadhaar-specific identity text.
                     if not using_geometric_fallback and detection.confidence >= self.settings.document_confidence:
                         page_failures.append(exc)
                 except UnsafeDocument as exc:
-                    # OpenCV proposals are hypotheses. Do not let a bad inner
-                    # rectangle (for example a portrait photo inside the
-                    # document) prevent the full-page hypothesis below from
-                    # being evaluated.
+                    # Non-Aadhaar proposals are filtered before this point;
+                    # retain safety failures for any geometry source.
                     if not using_geometric_fallback and detection.confidence >= self.settings.document_confidence:
                         page_failures.append(exc)
 
@@ -118,6 +125,8 @@ class AadhaarPipeline:
                         page,
                         self._full_frame_detection(page),
                     )
+                except _NotAadhaarCandidate:
+                    fallback_result = None
                 except NoAadhaarNumber as exc:
                     fallback_result = None
                     fallback_failure = exc
@@ -148,7 +157,7 @@ class AadhaarPipeline:
                         page,
                         self._full_frame_detection(page),
                     )
-                except (NoAadhaarNumber, UnsafeDocument):
+                except (_NotAadhaarCandidate, NoAadhaarNumber, UnsafeDocument):
                     broader_result = None
                 if (
                     broader_result is not None
@@ -161,12 +170,15 @@ class AadhaarPipeline:
                 detected_any = True
                 if page_failures:
                     first_failure = first_failure or page_failures[0]
-            elif had_primary_candidates:
+            elif page_failures or fallback_failure is not None:
                 detected_any = True
                 if page_failures:
                     first_failure = first_failure or page_failures[0]
-                elif fallback_failure is not None and not using_geometric_fallback:
+                elif fallback_failure is not None:
                     first_failure = first_failure or fallback_failure
+            elif page_has_aadhaar_back_without_number:
+                detected_any = True
+                first_failure = first_failure or NoAadhaarNumber()
 
         if not detected_any:
             raise NoAadhaarDetected()
@@ -273,6 +285,7 @@ class AadhaarPipeline:
         saw_valid_number = False
         saw_number_region = False
         saw_verification_failure = False
+        saw_aadhaar_identity = False
         boundary_confidence = float(detection.confidence)
         if detection.boundary_agreement is not None:
             boundary_confidence = min(boundary_confidence, detection.boundary_agreement)
@@ -291,6 +304,16 @@ class AadhaarPipeline:
                 max_long_edge=ocr_max_long_edge,
             )
             valid_lines = self._valid_number_lines(lines)
+            aadhaar_identity_anchor = has_aadhaar_identity_anchor(lines)
+            if has_pan_identity_anchor(lines) and not aadhaar_identity_anchor:
+                continue
+            if not aadhaar_identity_anchor and not valid_lines:
+                # Do not classify a generic card-shaped proposal as Aadhaar
+                # from its boundary alone. OCR may miss the Hindi Aadhaar
+                # label, so a Verhoeff-valid number proceeds to independent
+                # layout, model, and masking checks below.
+                continue
+            saw_aadhaar_identity = True
             saw_valid_number = saw_valid_number or bool(valid_lines)
 
             if not valid_lines:
@@ -352,9 +375,11 @@ class AadhaarPipeline:
                 number_detector_confidence=number_detector_confidence,
             )
 
+        if not saw_aadhaar_identity:
+            raise _NotAadhaarCandidate()
         if detection.class_name == "aadhaar_back" and not saw_valid_number and not saw_number_region:
-            # A back-only card commonly contains no printed Aadhaar number. It
-            # is a valid detection but there is nothing for this service to emit.
+            # A back-only card is recognized as Aadhaar, but contains no number
+            # line this service can safely redact.
             return None
         if saw_verification_failure:
             raise UnsafeDocument(
