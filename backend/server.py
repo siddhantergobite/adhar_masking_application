@@ -11,6 +11,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
+from .ai_summary import CardSummaryRequest, confidence_score, pipeline_confidence_score, summarize_card_result
 from .candidates import OpenCvDocumentProposer
 from .detectors import (
     DetectorConfigurationError,
@@ -19,7 +20,7 @@ from .detectors import (
 )
 from .documents import input_pages, make_flattened_pdf
 from .errors import ModelNotReady, PipelineError
-from .ocr import load_ocr_engine
+from .ocr import configure_cpu_threads, load_ocr_engine
 from .pipeline import AadhaarPipeline
 from .settings import Settings
 
@@ -32,6 +33,9 @@ _pipeline_lock = threading.Lock()
 
 
 def _load_pipeline(settings: Settings) -> AadhaarPipeline:
+    # Configure OpenMP/MKL before Ultralytics imports PyTorch. The same
+    # bounded setting is used by PaddleOCR later in pipeline initialization.
+    configure_cpu_threads()
     document_segmenter = UltralyticsDocumentSegmenter(
         settings.document_model_path,
         device=settings.yolo_device,
@@ -134,6 +138,11 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.post("/api/card-summary")
+async def card_summary(request: CardSummaryRequest) -> dict[str, Any]:
+    return await run_in_threadpool(summarize_card_result, request)
+
+
 def _process_serial(pipeline: AadhaarPipeline, pages: list[Any]):
     with _pipeline_lock:
         return pipeline.process(pages)
@@ -167,6 +176,25 @@ async def process_document(file: UploadFile = File(...)) -> Response:
     classes = sorted({document.document_class for document in result.documents})
     minimum_document_confidence = min(document.document_confidence for document in result.documents)
     minimum_verification_confidence = min(document.verification_confidence for document in result.documents)
+    minimum_boundary_confidence = min(document.boundary_confidence for document in result.documents)
+    minimum_scan_quality = min(document.scan_quality_score for document in result.documents)
+    minimum_ocr_confidence = min(document.ocr_confidence for document in result.documents)
+    number_detector_scores = [
+        document.number_detector_confidence
+        for document in result.documents
+        if document.number_detector_confidence is not None
+    ]
+    minimum_number_detector_confidence = min(number_detector_scores) if number_detector_scores else None
+    pipeline_score = pipeline_confidence_score(result)
+    score_request = CardSummaryRequest(
+        outcome="success",
+        document_count=len(result.documents),
+        masked_regions=result.masked_regions,
+        document_classes=classes,
+        document_confidence=minimum_document_confidence,
+        verification_confidence=minimum_verification_confidence,
+        pipeline_score=pipeline_score,
+    )
     return Response(
         content=flattened_pdf,
         media_type="application/pdf",
@@ -176,7 +204,16 @@ async def process_document(file: UploadFile = File(...)) -> Response:
             "X-Redacted-Regions": str(result.masked_regions),
             "X-Document-Classes": ",".join(classes),
             "X-Document-Confidence": f"{minimum_document_confidence:.3f}",
+            "X-Boundary-Confidence": f"{minimum_boundary_confidence:.3f}",
+            "X-Scan-Quality-Score": f"{minimum_scan_quality:.3f}",
+            "X-OCR-Confidence": f"{minimum_ocr_confidence:.3f}",
             "X-Verification-Confidence": f"{minimum_verification_confidence:.3f}",
+            "X-Number-Localization-Confidence": (
+                f"{minimum_number_detector_confidence:.3f}"
+                if minimum_number_detector_confidence is not None
+                else "not_matched"
+            ),
+            "X-Masking-Confidence": str(confidence_score(score_request)),
             "Cache-Control": "no-store, private",
             "Pragma": "no-cache",
             "X-Content-Type-Options": "nosniff",

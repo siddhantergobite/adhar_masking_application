@@ -62,6 +62,18 @@ class AadhaarPipeline:
             else:
                 detections = []
 
+            # When the strict YOLO result and the sole OpenCV proposal agree
+            # on one strong document boundary, the verified crop already has
+            # independent geometry confirmation. Keep the full-page OCR pass
+            # for ambiguous scenes, multiple candidates, and weaker matches.
+            single_reconciled_candidate = (
+                len(primary_detections) == 1
+                and primary_detections[0].confidence >= self.settings.document_confidence
+                and len(proposals) == 1
+                and len(detections) == 1
+                and box_iou(primary_detections[0].box, proposals[0].box) >= 0.80
+            )
+
             # A model box can be valid Aadhaar identity evidence while still
             # clipping the physical page.  Treat the complete image as a
             # last-chance candidate, after the learned/geometric candidates,
@@ -125,6 +137,7 @@ class AadhaarPipeline:
                 and len(page_results) == 1
                 and not page_failures
                 and not used_full_frame_fallback
+                and not single_reconciled_candidate
             ):
                 # A full-page candidate is considered only when it proves
                 # that the bounded crop missed an additional verified number.
@@ -221,7 +234,7 @@ class AadhaarPipeline:
             if not compatible:
                 refined.append(detection)
                 continue
-            _, proposal = max(compatible, key=lambda item: item[0])
+            best_overlap, proposal = max(compatible, key=lambda item: item[0])
             refined.append(
                 VisionDetection(
                     class_name=detection.class_name,
@@ -229,6 +242,7 @@ class AadhaarPipeline:
                     polygon=proposal.polygon,
                     box=proposal.box,
                     source=detection.source,
+                    boundary_agreement=best_overlap,
                 )
             )
         return refined
@@ -259,6 +273,11 @@ class AadhaarPipeline:
         saw_valid_number = False
         saw_number_region = False
         saw_verification_failure = False
+        boundary_confidence = float(detection.confidence)
+        if detection.boundary_agreement is not None:
+            boundary_confidence = min(boundary_confidence, detection.boundary_agreement)
+        blur_threshold = float(self.settings.min_blur_score)
+        scan_quality_score = min(quality_score / blur_threshold, 1.0) if blur_threshold > 0 else 1.0
 
         orientation_order = self._orientation_order(rectified.image, detection.class_name)
         orientation_attempts = max(1, min(4, int(getattr(self.settings, "orientation_attempts", 4))))
@@ -284,8 +303,12 @@ class AadhaarPipeline:
             saw_number_region = saw_number_region or bool(number_regions)
 
             number_detector_supported = False
+            number_detector_confidence: float | None = None
             if number_regions:
-                matched_lines, _ = self._match_number_regions(valid_lines, number_regions)
+                matched_lines, _, number_detector_confidence = self._match_number_regions(
+                    valid_lines,
+                    number_regions,
+                )
                 # OCR already supplied checksum-valid text and word-level
                 # coordinates. The number detector is useful corroboration,
                 # but a low-confidence/spurious box must not override exact
@@ -323,6 +346,10 @@ class AadhaarPipeline:
                 document_confidence=detection.confidence,
                 verification_confidence=verification.confidence,
                 masked_regions=len(valid_lines),
+                boundary_confidence=boundary_confidence,
+                scan_quality_score=scan_quality_score,
+                ocr_confidence=min(line.confidence for line in valid_lines),
+                number_detector_confidence=number_detector_confidence,
             )
 
         if detection.class_name == "aadhaar_back" and not saw_valid_number and not saw_number_region:
@@ -483,33 +510,39 @@ class AadhaarPipeline:
         self,
         lines: list[OcrLine],
         detections: list[NumberDetection],
-    ) -> tuple[list[OcrLine], int]:
+    ) -> tuple[list[OcrLine], int, float | None]:
         matched: list[OcrLine] = []
         used_line_ids: set[int] = set()
         unresolved = 0
+        support_scores: list[float] = []
         for detection in detections:
             region = self._expanded_box(detection.box)
-            choices: list[tuple[float, int, OcrLine]] = []
+            choices: list[tuple[float, float, int, OcrLine]] = []
             for index, line in enumerate(lines):
                 if index in used_line_ids:
                     continue
                 line_bounds = polygon_box(line.polygon)
                 overlap = overlap_over_first(line_bounds, region)
                 if overlap >= 0.42:
-                    choices.append((overlap + line.confidence * 0.1, index, line))
+                    choices.append((overlap + line.confidence * 0.1, overlap, index, line))
             if not choices:
                 unresolved += 1
                 continue
-            _, index, line = max(choices, key=lambda item: item[0])
+            _, overlap, index, line = max(choices, key=lambda item: item[0])
             used_line_ids.add(index)
             matched.append(line)
-        return matched, unresolved
+            support_scores.append(min(float(detection.confidence), overlap))
+
+        if not matched or not lines:
+            return matched, unresolved, None
+        coverage = len(used_line_ids) / len(lines)
+        return matched, unresolved, min(min(support_scores), coverage)
 
     def _assert_no_readable_aadhaar_remains(self, masked: np.ndarray) -> None:
         audit_lines = read_ocr_lines(
             self.ocr_engine,
             enhance_for_ocr(masked),
-            max_long_edge=max(320, int(getattr(self.settings, "ocr_max_long_edge", 1200))),
+            max_long_edge=max(320, int(getattr(self.settings, "ocr_audit_max_long_edge", 1200))),
         )
         if any(
             line.confidence >= self.settings.ocr_confidence

@@ -10,3 +10,7 @@ backend/models/*.pt
 backend/models/*.onnx
 backend/models/*.engine
 tmp/
+.env
+.env.*
+!.env.example
+.venv311/

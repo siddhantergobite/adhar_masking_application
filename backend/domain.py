@@ -12,6 +12,7 @@ class VisionDetection:
     polygon: np.ndarray
     box: np.ndarray
     source: str = "yolo"
+    boundary_agreement: float | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,10 @@ class ProcessedDocument:
     document_confidence: float
     verification_confidence: float
     masked_regions: int
+    boundary_confidence: float = 0.0
+    scan_quality_score: float = 0.0
+    ocr_confidence: float = 0.0
+    number_detector_confidence: float | None = None
 
 
 @dataclass(frozen=True)

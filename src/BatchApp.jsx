@@ -22,15 +22,86 @@ function createFileItem(file) {
     documentClasses: [],
     documentConfidence: 0,
     verificationConfidence: 0,
+    confidenceScore: null,
+    summary: '',
+    summarySource: '',
+    summaryRequestId: '',
     showMasked: false,
   };
 }
 
 function statusLabel(item) {
-  if (item.status === 'processing') return 'Processing locally';
+  if (item.status === 'processing') return 'Processing document';
   if (item.status === 'done') return 'Masked copy ready';
   if (item.status === 'error') return 'Needs attention';
   return 'Waiting in queue';
+}
+
+function fallbackSummary(payload) {
+  if (payload.outcome === 'success') {
+    const docs = `${payload.document_count} Aadhaar document${payload.document_count === 1 ? '' : 's'}`;
+    const regions = `${payload.masked_regions} number line${payload.masked_regions === 1 ? '' : 's'}`;
+    const score = Number.isFinite(payload.pipeline_score) ? ` Evidence-weighted masking confidence score: ${payload.pipeline_score}/100.` : '';
+    return `The local checks accepted a masked copy for ${docs} and redacted ${regions}.${score}`;
+  }
+  if (payload.outcome === 'rejected') return 'No safe masked copy was produced, so this file needs review or a clearer upload.';
+  return 'Processing did not finish, so confidence could not be measured.';
+}
+
+function ConfidenceSummary({ item }) {
+  const settled = item.status === 'done' || item.status === 'error';
+  const summary = item.summary || (settled ? 'Preparing a short result summary…' : 'A short summary will appear after processing.');
+  const sourceLabel = item.summarySource === 'gpt-5-nano'
+    ? 'GPT-5-nano'
+    : item.summarySource === 'local'
+      ? 'Local summary'
+      : '';
+  return (
+    <section className="confidence-summary" aria-label="Result summary">
+      <div className="confidence-summary-heading">
+        <span>Result summary</span>
+        {sourceLabel && <small>{sourceLabel}</small>}
+      </div>
+      <p>{summary}</p>
+    </section>
+  );
+}
+
+function ConfidenceGauge({ item }) {
+  const settled = item.status === 'done' || item.status === 'error';
+  const score = Number.isFinite(item.confidenceScore) ? item.confidenceScore : null;
+  const circumference = 2 * Math.PI * 34;
+  const offset = score === null ? circumference : circumference * (1 - score / 100);
+  const tone = score === null ? 'unknown' : score >= 80 ? 'green' : score >= 60 ? 'amber' : 'low';
+  const reading = score === null ? (settled ? '—' : '…') : score;
+  const scoreDescription = score === null ? (settled ? 'not scored' : 'pending') : `${score} out of 100`;
+
+  return (
+    <div
+      className={`confidence-gauge confidence-gauge-${tone}`}
+      role="img"
+      aria-label={`End-to-end masking confidence score ${scoreDescription}`}
+      title="Evidence-weighted score from boundary detection, scan quality, OCR, Aadhaar identity checks, and number-region corroboration. A missing number-detector match is neutral because OCR word boxes locate the mask. Digit-position checks and the post-mask OCR audit must pass before a file is returned. This is a pipeline score, not a probability. Rejected or unfinished files have no score because there is no masked result to assess."
+    >
+      <svg viewBox="0 0 88 88" aria-hidden="true">
+        <circle className="confidence-gauge-track" cx="44" cy="44" r="34" />
+        <circle
+          className="confidence-gauge-progress"
+          cx="44"
+          cy="44"
+          r="34"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 44 44)"
+        />
+      </svg>
+      <div className="confidence-gauge-reading">
+        <strong>{reading}</strong>
+        {score !== null && <span>/100</span>}
+      </div>
+      <small>{score === null ? (settled ? 'not scored' : 'pending') : 'pipeline'}</small>
+    </div>
+  );
 }
 
 function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult }) {
@@ -71,6 +142,7 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
             </DisplayErrorBoundary>
           </div>
         )}
+        {(item.status !== 'done' || item.showMasked) && <ConfidenceGauge item={item}/>}
       </div>
 
       <div className="document-card-footer">
@@ -86,16 +158,18 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
 
         {item.status === 'done' ? (
           <div className="document-card-result">
-            <p>{item.documentCount} Aadhaar document{item.documentCount === 1 ? '' : 's'} isolated; {item.maskedCount} number line{item.maskedCount === 1 ? '' : 's'} redacted.{item.documentClasses?.length ? ` Detected: ${item.documentClasses.map((name) => name.replaceAll('_', ' ')).join(', ')}.` : ''}</p>
+            <ConfidenceSummary item={item}/>
             <a className="download-result-button" href={item.maskedUrl} download={item.maskedFile.name}>Download masked PDF <Icon name="arrow" size={14}/></a>
           </div>
         ) : item.status === 'error' ? (
           <div className="document-card-result document-card-error">
+            <ConfidenceSummary item={item}/>
             <p>{item.error}</p>
             <button className="card-retry-button" type="button" onClick={() => onRetry(item.id)}>Try again <Icon name="arrow" size={14}/></button>
           </div>
         ) : (
           <div className="document-card-result document-card-progress">
+            <ConfidenceSummary item={item}/>
             <p>{item.status === 'processing' ? 'The private pipeline is identifying, verifying, and masking this document.' : 'This file will be processed automatically when the local service is ready.'}</p>
           </div>
         )}
@@ -115,6 +189,55 @@ function BatchApp() {
   const processingIdRef = useRef(null);
   const abortControllersRef = useRef(new Map());
   const cancelledIdsRef = useRef(new Set());
+
+  async function requestCardSummary(id, requestId, payload) {
+    let result = { summary: fallbackSummary(payload), source: 'local' };
+    try {
+      const response = await fetch('/api/card-summary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) {
+        const candidate = await response.json();
+        if (typeof candidate.summary === 'string' && candidate.summary.trim()) {
+          result = { summary: candidate.summary, source: candidate.source === 'gpt-5-nano' ? 'gpt-5-nano' : 'local' };
+        }
+      }
+    } catch {
+      // Keep the card useful when Azure credentials or network access are unavailable.
+    }
+    setFiles((current) => current.map((candidate) => candidate.id === id && candidate.summaryRequestId === requestId
+      ? { ...candidate, summary: result.summary, summarySource: result.source }
+      : candidate));
+  }
+
+  function reportFailure(id, message, reasonCode) {
+    const rejectionCodes = new Set(['no_aadhaar_detected', 'review_required', 'no_aadhaar_number']);
+    const outcome = rejectionCodes.has(reasonCode) ? 'rejected' : 'unavailable';
+    const requestId = `${id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const allowedCodes = ['no_aadhaar_detected', 'review_required', 'no_aadhaar_number', 'models_not_ready', 'ocr_failed', 'processing_failed', 'processing_timeout', 'unsupported_file', 'file_too_large'];
+    const payload = {
+      outcome,
+      document_count: 0,
+      masked_regions: 0,
+      document_classes: [],
+      document_confidence: null,
+      verification_confidence: null,
+      pipeline_score: null,
+      reason_code: allowedCodes.includes(reasonCode) ? reasonCode : 'processing_failed',
+    };
+    setFiles((current) => current.map((candidate) => candidate.id === id ? {
+      ...candidate,
+      status: 'error',
+      error: message,
+      confidenceScore: null,
+      summary: 'Preparing a short result summary…',
+      summarySource: '',
+      summaryRequestId: requestId,
+    } : candidate));
+    void requestCardSummary(id, requestId, payload);
+  }
 
   useEffect(() => {
     filesRef.current = files;
@@ -204,6 +327,10 @@ function BatchApp() {
       ...item,
       status: 'queued',
       error: '',
+      confidenceScore: null,
+      summary: '',
+      summarySource: '',
+      summaryRequestId: '',
       showMasked: false,
     } : item));
   }
@@ -217,11 +344,7 @@ function BatchApp() {
 
     const originalFile = item.originalFile ?? item.file;
     if (!originalFile) {
-      setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
-        ...candidate,
-        status: 'error',
-        error: 'The original upload is no longer available. Please upload this file again.',
-      } : candidate));
+      reportFailure(item.id, 'The original upload is no longer available. Please upload this file again.', 'processing_failed');
       return;
     }
 
@@ -245,7 +368,9 @@ function BatchApp() {
         const detail = payload.detail;
         const message = typeof detail === 'string' ? detail : detail?.message;
         const action = typeof detail === 'object' ? detail?.action : '';
-        throw new Error([message, action].filter(Boolean).join(' ') || 'The document could not be processed.');
+        const error = new Error([message, action].filter(Boolean).join(' ') || 'The document could not be processed.');
+        error.code = typeof detail === 'object' ? detail?.code : response.status === 413 ? 'file_too_large' : response.status === 415 ? 'unsupported_file' : 'processing_failed';
+        throw error;
       }
 
       const blob = await response.blob();
@@ -259,26 +384,50 @@ function BatchApp() {
 
       const safeName = originalFile.name.replace(/\.[^.]+$/, '');
       const maskedFile = new File([blob], `${safeName}-masked.pdf`, { type: 'application/pdf' });
+      const documentConfidence = Number(response.headers.get('X-Document-Confidence') || 0);
+      const verificationConfidence = Number(response.headers.get('X-Verification-Confidence') || 0);
+      const scoreHeader = response.headers.get('X-Masking-Confidence');
+      const confidenceScore = scoreHeader === null
+        ? null
+        : Number(scoreHeader);
+      const documentCount = Number(response.headers.get('X-Aadhaar-Documents') || 0);
+      const maskedCount = Number(response.headers.get('X-Redacted-Regions') || 0);
+      const documentClasses = (response.headers.get('X-Document-Classes') || '').split(',').filter(Boolean);
+      const requestId = `${item.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const summaryPayload = {
+        outcome: 'success',
+        document_count: documentCount,
+        masked_regions: maskedCount,
+        document_classes: documentClasses,
+        document_confidence: documentConfidence,
+        verification_confidence: verificationConfidence,
+        pipeline_score: Number.isFinite(confidenceScore) ? confidenceScore : null,
+      };
       setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
         ...candidate,
         status: 'done',
         maskedFile,
         maskedUrl: nextUrl,
-        maskedCount: Number(response.headers.get('X-Redacted-Regions') || 0),
-        documentCount: Number(response.headers.get('X-Aadhaar-Documents') || 0),
-        documentClasses: (response.headers.get('X-Document-Classes') || '').split(',').filter(Boolean),
-        documentConfidence: Number(response.headers.get('X-Document-Confidence') || 0),
-        verificationConfidence: Number(response.headers.get('X-Verification-Confidence') || 0),
+        maskedCount,
+        documentCount,
+        documentClasses,
+        documentConfidence,
+        verificationConfidence,
+        confidenceScore: Number.isFinite(confidenceScore) ? Math.max(0, Math.min(100, confidenceScore)) : null,
+        summary: 'Preparing a short result summary…',
+        summarySource: '',
+        summaryRequestId: requestId,
         // Show the safe result as soon as processing finishes.  The Original
         // tab remains available for an explicit comparison.
         showMasked: true,
         error: '',
       } : candidate));
+      void requestCardSummary(item.id, requestId, summaryPayload);
     } catch (error) {
       if (timedOut) {
-        setFiles((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, status: 'error', error: 'Local processing exceeded 90 seconds. Try a clearer or more tightly framed document image.' } : candidate));
+        reportFailure(item.id, 'Local processing exceeded 90 seconds. Try a clearer or more tightly framed document image.', 'processing_timeout');
       } else if (error.name !== 'AbortError' && !cancelledIdsRef.current.has(item.id)) {
-        setFiles((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, status: 'error', error: error.message || 'Could not reach the local processing service.' } : candidate));
+        reportFailure(item.id, error.message || 'Could not reach the local processing service.', error.code || 'processing_failed');
       }
     } finally {
       window.clearTimeout(timeoutId);

@@ -50,7 +50,8 @@ class Settings:
     min_region_edge: int
     min_blur_score: float
     orientation_attempts: int = 2
-    ocr_max_long_edge: int = 1200
+    ocr_max_long_edge: int = 960
+    ocr_audit_max_long_edge: int = 1200
     document_fallback_confidence: float = 0.12
     number_fallback_confidence: float = 0.12
 
@@ -88,7 +89,10 @@ class Settings:
             # PaddleOCR is CPU-bound on the full rectified page. OCR boxes are
             # mapped back to the full-resolution page before masking, so this
             # only reduces OCR cost and does not reduce output quality.
-            ocr_max_long_edge=_env_int("AADHAAR_OCR_MAX_LONG_EDGE", 1200, 320),
+            # A smaller first-pass OCR image speeds up CPU inference. Keep the
+            # post-mask audit at a separate, higher resolution for safety.
+            ocr_max_long_edge=_env_int("AADHAAR_OCR_MAX_LONG_EDGE", 960, 320),
+            ocr_audit_max_long_edge=_env_int("AADHAAR_OCR_AUDIT_MAX_LONG_EDGE", 1200, 320),
             # The bootstrap YOLO weights are calibrated on clean material and
             # can score real phone captures below the strict primary threshold.
             # A second, lower-confidence pass is only used when the primary

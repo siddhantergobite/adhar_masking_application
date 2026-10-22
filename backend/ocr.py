@@ -22,12 +22,23 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-def load_ocr_engine() -> Any:
-    from paddleocr import PaddleOCR
+def configure_cpu_threads() -> int:
+    """Use one consistent, bounded thread count for CPU inference."""
 
-    default_threads = min(8, os.cpu_count() or 4)
-    batch_size = _positive_int_env("AADHAAR_OCR_BATCH_SIZE", 8)
+    default_threads = min(4, os.cpu_count() or 4)
     cpu_threads = _positive_int_env("AADHAAR_OCR_CPU_THREADS", default_threads)
+    # Set these before importing PyTorch/Paddle so their CPU runtimes do not
+    # oversubscribe the laptop's cores. They are scoped to this service process.
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    return cpu_threads
+
+
+def load_ocr_engine() -> Any:
+    cpu_threads = configure_cpu_threads()
+    batch_size = _positive_int_env("AADHAAR_OCR_BATCH_SIZE", 8)
+
+    from paddleocr import PaddleOCR
 
     return PaddleOCR(
         # The mobile English models keep word boxes but are substantially
