@@ -23,3 +23,16 @@
 .confidence-gauge{top:12px;right:12px;width:64px;height:64px;background:rgba(246,252,247,.5);box-shadow:0 4px 12px #1e47301a;backdrop-filter:blur(2px)}.confidence-gauge-amber{background:rgba(255,251,241,.5);border-color:rgba(240,221,186,.7)}.confidence-gauge-low{background:rgba(255,247,245,.5);border-color:rgba(237,208,202,.7)}.confidence-gauge-unknown{background:rgba(247,249,247,.5);border-color:rgba(220,228,221,.7)}.confidence-gauge-reading{top:20px}.confidence-gauge-reading strong{font-size:15px}.confidence-gauge-reading span{font-size:5.5px}.confidence-gauge>small{bottom:6px;font-size:4.8px}
 @media(max-width:700px){.confidence-gauge{top:9px;right:9px;width:56px;height:56px}.confidence-gauge-reading{top:17px}.confidence-gauge-reading strong{font-size:13px}.confidence-gauge-reading span{font-size:4.8px}.confidence-gauge>small{bottom:5px;font-size:4.2px}}
 @media(max-width:700px){.document-card-preview .document-preview-slot{min-height:218px}}
+
+/* Slightly larger helper and result text for the batch workflow. */
+.batch-page .upload-card-copy p{font-size:12px;line-height:1.5}
+.batch-page .upload-format-row span{font-size:9px}
+.batch-page .upload-max{font-size:10px}
+.batch-page .upload-note{font-size:11px;line-height:1.5}
+.batch-page .document-card .result-tabs button{font-size:10px}
+.batch-page .document-card .document-status{font-size:10px}
+.batch-page .document-card .confidence-summary-heading{font-size:10px}
+.batch-page .document-card .confidence-summary-heading strong{font-size:11px}
+.batch-page .document-card .confidence-summary-heading small{font-size:9px}
+.batch-page .document-card .confidence-summary p{font-size:10px!important;line-height:1.55!important}
+.batch-page .document-card .download-result-button{min-height:38px;font-size:10px}
