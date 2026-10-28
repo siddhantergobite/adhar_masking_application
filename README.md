@@ -66,7 +66,7 @@ Open two PowerShell terminals in the project root.
 Terminal 1 - start the local API:
 
 ~~~powershell
-.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8002 --no-access-log
+.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8002 --workers 1 --no-access-log
 ~~~
 
 Terminal 2 - start the web app:
@@ -77,11 +77,105 @@ npm run dev
 
 Open the Vite URL printed in the second terminal. The current Vite configuration uses `http://127.0.0.1:5174/` and proxies `/api` requests to the API at `http://127.0.0.1:8002`.
 
-The API provides `GET /api/health` for readiness and `POST /api/process` for one uploaded file. The browser's multi-file queue sends each file in its own request. A successful response is a flattened PDF with `Cache-Control: no-store, private`.
+The API provides `GET /api/health` for readiness and `POST /api/process` for one uploaded file. The browser's multi-file queue sends each file in its own request. A successful response is a flattened PDF with `Cache-Control: no-store, private`. The backend's inference lock serializes processing on CPU. For folder or multi-file jobs, use the batch routes below.
 
 The browser also calls `POST /api/card-summary` with the validated, non-identifying result metadata described above. The Azure API key stays in the backend environment and is never sent to the browser.
 
 If you do not already have a `.env`, copy `.env.example` to create one; otherwise, keep your existing credentials and add or update `AZURE_OPENAI_MODEL`. The setting must match the GPT-5-nano deployment name in your Azure resource. Keep `.env` local; it is ignored by Git.
+
+## CPU-only batch API
+
+The batch API accepts up to 30 supported files per batch and processes them **one at a time on CPU**. It reuses the same Aadhaar verification, masking, and post-mask OCR safety checks as the single-file route. A batch returns a job ID immediately; use the status route to see progress and download completed outputs. Batch state is stored in SQLite under the local batch storage folder. Uploaded copies are removed after processing; masked outputs and the manifest are retained for 24 hours by default.
+
+The web app has a **Folder and Cloudflare Workers KV imports** panel. **Process local inbox** scans `AADHAAR_BATCH_INPUT_ROOT` directly, so a browser folder-upload control is not needed. Your configured inbox is `C:\Users\admin\Documents\AadhaarInbox`; the app scans its top level by default. You can store those local files in a private Workers KV namespace first, then separately import the stored files for local processing, or import values already stored under the KV inbox prefix.
+
+Open the interactive API page at `http://127.0.0.1:8002/docs` while the local API is running. The main routes are:
+
+| Method and route | Purpose |
+| --- | --- |
+| `POST /api/batches` | Upload several PDFs/images as repeated multipart `files` fields and queue them. |
+| `POST /api/batches/folder` | Queue supported files from a subfolder of the configured local inbox. |
+| `POST /api/batches/s3` | Queue supported files from a configured S3 input prefix. |
+| `POST /api/batches/r2` | Queue supported files from the configured private Cloudflare R2 inbox prefix. |
+| `POST /api/batches/r2/upload-folder` | Upload files from the configured local inbox to private R2 and process them. |
+| `POST /api/batches/kv/store-folder` | Copy supported local inbox files to a private Workers KV prefix without starting masking. |
+| `POST /api/batches/kv` | Queue supported files from the configured Workers KV inbox prefix, optionally limited to a relative key prefix. |
+| `POST /api/batches/kv/upload-folder` | Store configured local inbox files in Workers KV and process them locally. |
+| `GET /api/batches/{batch_id}` | Check batch and per-file status, rejection reason, score, and download links. |
+| `GET /api/batches/{batch_id}/files/{file_id}/download` | Download one completed masked PDF. |
+| `GET /api/batches/{batch_id}/download.zip` | Download successful PDFs plus a JSON manifest of all file outcomes. |
+| `DELETE /api/batches/{batch_id}` | Delete a finished local batch and, when configured, its cloud output objects. |
+
+The default local storage path on Windows is `%LOCALAPPDATA%\AadhaarMaskingWorkbench\batches`. Each job's masked PDFs and manifest are saved under `jobs\<batch_id>\output`. To keep results in a folder you can easily find, set `AADHAAR_BATCH_STORAGE_ROOT` in `.env` to a dedicated path under Documents, for example `C:\Users\admin\Documents\AadhaarMaskingResults`.
+
+For a watched input folder, set `AADHAAR_BATCH_INPUT_ROOT` to a dedicated folder such as `C:\Users\admin\Documents\AadhaarInbox`, copy up to 30 source PDFs/images there, and restart the backend. The API only reads files inside this configured root. Then call `POST /api/batches/folder` with:
+
+```json
+{"relative_folder": ".", "recursive": false}
+```
+
+The route only reads inside that configured root; it does not accept arbitrary computer paths. It copies inputs into the private batch workspace and leaves the originals in the inbox.
+
+Example from PowerShell, after the backend is running:
+
+~~~powershell
+$api = 'http://127.0.0.1:8002'
+$headers = @{}
+if ($env:AADHAAR_BATCH_API_KEY) { $headers['X-API-Key'] = $env:AADHAAR_BATCH_API_KEY }
+$job = Invoke-RestMethod -Method Post -Uri "$api/api/batches/folder" `
+  -Headers $headers `
+  -ContentType 'application/json' `
+  -Body '{"relative_folder":".","recursive":false}'
+$job
+
+# Check progress later with the returned batch_id:
+Invoke-RestMethod "$api/api/batches/$($job.batch_id)" -Headers $headers
+
+# After it finishes, save the ZIP of successful PDFs and the result manifest:
+Invoke-WebRequest "$api$($job.download_zip_url)" `
+  -Headers $headers `
+  -OutFile "$env:USERPROFILE\Documents\masked-batch.zip"
+~~~
+
+For direct API uploads, use `POST /api/batches` in the interactive page at `http://127.0.0.1:8002/docs` and add each PDF/image as a repeated `files` field. The status response includes a `batch_id`, per-file outcomes, and download links. A non-Aadhaar or uncertain file is reported as rejected and has no masked PDF.
+
+Cloudflare Workers KV support is optional. Create a KV namespace, then set these values in the ignored backend `.env` file. Create a Cloudflare API token with **Workers KV Storage Edit** permission and keep it out of the browser and source control:
+
+```text
+CLOUDFLARE_KV_ACCOUNT_ID=your-account-id
+CLOUDFLARE_KV_NAMESPACE_ID=your-kv-namespace-id
+CLOUDFLARE_KV_API_TOKEN=your-scoped-api-token
+CLOUDFLARE_KV_INPUT_PREFIX=aadhaar/inbox
+CLOUDFLARE_KV_OUTPUT_PREFIX=aadhaar/masked
+```
+
+The input and masked-output prefixes must remain separate. Restart the backend. In the web app, click **Upload inbox to Workers KV** to store the supported top-level files from the configured local inbox without starting masking. The app shows the exact key prefix; you can inspect it under the namespace's **KV Pairs** tab. Then click **Process uploaded KV files** to fetch those values and run local CPU masking. Masked copies go under the separate output prefix and are also available through the local batch download route. Original KV inputs remain until removed from the namespace; masked KV copies follow the batch retention period. No public URL is created. KV operations require internet access; local processing remains available offline.
+
+The Workers Free plan has limited quotas, including 1 GB of stored data, 25 MiB per value, and daily read/write limits. Keep the account on the Free plan and keep files within the published limits; over-limit operations fail on the Free plan. See Cloudflare's [Workers KV pricing and limits](https://developers.cloudflare.com/workers/platform/pricing/) before using client documents. Cloudflare KV is a small key-value service rather than an object-storage bucket; use it here only when the document set fits the per-value and namespace limits.
+
+The backend calls Cloudflare's KV API directly; a separate deployed Worker is not required. Aadhaar detection, OCR, validation, and masking still run on the local CPU.
+
+Cloudflare R2 support remains available as an optional connector. It uses a private R2 bucket, scoped R2 API token, and `backend/requirements-s3.txt`. Set these variables in the ignored `.env` file:
+
+```text
+CLOUDFLARE_R2_ACCOUNT_ID=your-account-id
+CLOUDFLARE_R2_BUCKET=your-private-bucket
+CLOUDFLARE_R2_ACCESS_KEY_ID=your-r2-access-key-id
+CLOUDFLARE_R2_SECRET_ACCESS_KEY=your-r2-secret-access-key
+CLOUDFLARE_R2_INPUT_PREFIX=aadhaar/inbox
+CLOUDFLARE_R2_UPLOAD_PREFIX=aadhaar/uploads
+CLOUDFLARE_R2_OUTPUT_PREFIX=aadhaar/masked
+```
+
+Keep the three R2 prefixes separate. Restart the backend. The R2 routes remain available to API clients; the web panel uses Workers KV. R2 input routes read from the configured private inbox prefix, and the R2 upload route copies local inbox files to the configured upload prefix before queueing them. Original files stay in the private bucket. Masked results are copied to the output prefix and are also available through the local batch download route. No public bucket or public link is created. R2 requires network access when used; local inbox processing works without it.
+
+R2 keys must be kept private and should not be committed to source control. To give someone else temporary access to a result, use a controlled authenticated API or a short-lived presigned download URL; do not make the bucket public. The batch API currently returns private `s3://` object references for R2 outputs. Original objects remain in R2 until you delete them or apply a bucket lifecycle rule. Masked R2 outputs follow the batch retention setting and are removed after 24 hours by default; increase `AADHAAR_BATCH_RETENTION_HOURS` if the client needs a longer review window.
+
+Generic S3 support remains available: install `backend/requirements-s3.txt`, configure `AADHAAR_S3_INPUT_BUCKET` plus a non-empty `AADHAAR_S3_INPUT_PREFIX`, and call `POST /api/batches/s3`. Set `AADHAAR_S3_OUTPUT_BUCKET` to copy successful masked PDFs back to S3. S3 ingestion/output needs network access when used; direct upload and local-folder processing do not.
+
+The defaults are 30 files per batch, 25 MiB per file, 750 MiB total per batch, 90 pending/processing files across batches, and 24-hour result retention. Override them with the corresponding `AADHAAR_BATCH_*` settings in `.env`. `AADHAAR_BATCH_API_KEY` optionally protects the batch routes with an `X-API-Key` header; it should be set before allowing clients beyond the local machine. The documented local API still binds to `127.0.0.1`; it is not a public hosted service.
+
+CPU inference is enforced by the API; YOLO uses `cpu`, PaddleOCR uses CPU, PyTorch/OpenCV/Paddle thread settings are capped at four, and one batch worker processes a single file at a time. This bounds inference concurrency, but does not promise a completion time. Benchmark a representative set before setting a client SLA. The current model weights remain synthetic bootstrap weights and need real-world, consented evaluation before production use.
 
 ## Runtime configuration
 
@@ -91,7 +185,7 @@ These environment variables can be used to configure the local service. Defaults
 | --- | --- | --- |
 | `AADHAAR_DOCUMENT_MODEL` | `backend/models/aadhaar-document-seg.pt` | Document segmentation checkpoint path |
 | `AADHAAR_NUMBER_MODEL` | `backend/models/aadhaar-number-det.pt` | Number detector checkpoint path |
-| `AADHAAR_YOLO_DEVICE` | `cpu` | YOLO device, such as `cpu` or `0` |
+| `AADHAAR_YOLO_DEVICE` | CPU, forced | Runtime YOLO inference is CPU-only; GPU selection is not exposed |
 | `AADHAAR_INFERENCE_SIZE` | `512` | YOLO inference image size |
 | `AADHAAR_DOCUMENT_CONFIDENCE` | `0.72` | Primary document detection confidence |
 | `AADHAAR_NUMBER_CONFIDENCE` | `0.62` | Primary number detection confidence |
@@ -131,10 +225,10 @@ npm run build
 ## Privacy and deployment
 
 - The documented local commands bind both services to `127.0.0.1`; image inference and masking use local YOLO checkpoints, OpenCV, and PaddleOCR. If configured, only result metadata is sent to Azure OpenAI to write the card summary.
-- The API does not persist source uploads as part of its normal processing flow and returns responses with `Cache-Control: no-store, private`.
+- The single-file API does not persist source uploads. Batch processing keeps a temporary copy until that file finishes, then removes it; masked batch outputs and status are retained locally for 24 hours by default.
 - The API command disables Uvicorn access logs so uploaded filenames are not recorded in routine request logs.
 - Do not add uploads, OCR text, or complete Aadhaar numbers to application logs, analytics, or error monitoring.
-- Before exposing the service on a network, add authentication, TLS, rate limits, request isolation, appropriate temporary storage controls, and a retention/deletion policy. Run LibreOffice conversion for untrusted files in an isolated worker or container.
+- The optional `AADHAAR_BATCH_API_KEY` protects batch routes. Before exposing any part of the service on a network, add application-wide authentication, TLS, rate limits, request isolation, appropriate temporary storage controls, and a reviewed retention/deletion policy. Run LibreOffice conversion for untrusted files in an isolated worker or container. The current command binds to localhost and does not create a public hosted API.
 - Review Ultralytics licensing before commercial deployment; see the [Ultralytics license page](https://www.ultralytics.com/license).
 
 ## Accuracy and release status

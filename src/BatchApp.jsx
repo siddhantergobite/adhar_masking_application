@@ -183,6 +183,12 @@ function BatchApp() {
   const [dragging, setDragging] = useState(false);
   const [engineStatus, setEngineStatus] = useState('checking');
   const [engineMessage, setEngineMessage] = useState('');
+  const [workersKvConfigured, setWorkersKvConfigured] = useState(false);
+  const [kvStoredUpload, setKvStoredUpload] = useState(null);
+  const [folderBatch, setFolderBatch] = useState(null);
+  const [folderImportBusy, setFolderImportBusy] = useState(false);
+  const [folderImportAction, setFolderImportAction] = useState('');
+  const [folderImportError, setFolderImportError] = useState('');
   const [queueTick, setQueueTick] = useState(0);
   const fileInputRef = useRef(null);
   const filesRef = useRef([]);
@@ -254,6 +260,7 @@ function BatchApp() {
         if (active) {
           setEngineStatus(status.ready ? 'ready' : (status.status || 'loading'));
           setEngineMessage(status.detail || '');
+          setWorkersKvConfigured(status.cloud_storage?.cloudflare_workers_kv_configured === true);
         }
       } catch {
         if (active) {
@@ -283,6 +290,84 @@ function BatchApp() {
     fileInputRef.current.value = '';
     fileInputRef.current.click();
   }
+
+  async function startFolderBatch(mode) {
+    const storeOnly = mode === 'kvStore';
+    if (folderImportBusy || (!storeOnly && engineStatus !== 'ready')) return;
+    const options = {
+      local: {
+        endpoint: '/api/batches/folder',
+        label: 'local inbox',
+      },
+      kvStore: {
+        endpoint: '/api/batches/kv/store-folder',
+        label: 'local inbox stored in Workers KV',
+      },
+      kvImport: {
+        endpoint: '/api/batches/kv',
+        label: kvStoredUpload ? 'uploaded Workers KV files' : 'private Workers KV inbox',
+      },
+    };
+    const selected = options[mode];
+    if (!selected) return;
+
+    setFolderImportBusy(true);
+    setFolderImportAction(storeOnly ? 'Storing the local inbox in Workers KV' : `Starting the ${selected.label} import`);
+    setFolderImportError('');
+    setFolderBatch(null);
+    try {
+      const response = await fetch(selected.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mode === 'kvImport'
+          ? { relative_prefix: kvStoredUpload?.relative_prefix || '' }
+          : { relative_folder: '.', recursive: false }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload.detail === 'string' ? payload.detail : 'The folder could not be imported.';
+        throw new Error(detail);
+      }
+      if (storeOnly) {
+        setKvStoredUpload(payload);
+        setFolderBatch(null);
+      } else {
+        setFolderBatch({ ...payload, import_label: selected.label });
+        if (mode === 'kvImport' && kvStoredUpload) setKvStoredUpload(null);
+      }
+    } catch (error) {
+      setFolderImportError(error.message || 'Could not contact the local batch service.');
+    } finally {
+      setFolderImportBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    const batchId = folderBatch?.batch_id;
+    if (!batchId || !['queued', 'processing'].includes(folderBatch.status)) return undefined;
+    let active = true;
+
+    async function refreshBatch() {
+      try {
+        const response = await fetch(`/api/batches/${batchId}`);
+        const payload = await response.json().catch(() => ({}));
+        if (active && response.ok) {
+          setFolderBatch((current) => current?.batch_id === batchId
+            ? { ...payload, import_label: current.import_label }
+            : current);
+        }
+      } catch {
+        // Keep the last known job state and retry on the next poll.
+      }
+    }
+
+    const timer = window.setInterval(refreshBatch, 1800);
+    void refreshBatch();
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [folderBatch?.batch_id, folderBatch?.status]);
 
   function addFiles(candidates) {
     const incoming = Array.from(candidates || []).filter(Boolean);
@@ -478,6 +563,61 @@ function BatchApp() {
             </div>
             <div className="step-indicator"><span className="step-active">01</span><span className="step-line"/><span>02</span><span className="step-line"/><span>03</span></div>
           </div>
+
+          <details className="batch-import-panel" open>
+            <summary>Store inbox files in Cloudflare KV, then mask them locally</summary>
+            <div className="batch-import-content">
+              <p>Upload copies every supported file currently inside the configured <b>AadhaarInbox</b> folder to private Workers KV. This step does not start masking and does not include subfolders. Then import the stored copies to run masking on this computer's CPU.</p>
+              <div className="batch-import-actions">
+                <button type="button" onClick={() => startFolderBatch('local')} disabled={engineStatus !== 'ready' || folderImportBusy}>
+                  Process local inbox
+                </button>
+                <button type="button" onClick={() => startFolderBatch('kvStore')} disabled={folderImportBusy || !workersKvConfigured}>
+                  Upload inbox to Workers KV
+                </button>
+                <button type="button" onClick={() => startFolderBatch('kvImport')} disabled={engineStatus !== 'ready' || folderImportBusy || !workersKvConfigured}>
+                  {kvStoredUpload ? 'Process uploaded KV files' : 'Import existing Workers KV inbox'}
+                </button>
+              </div>
+              <div className="batch-import-note">
+                {workersKvConfigured
+                  ? 'Workers KV is configured. Upload stores originals without starting masking; importing starts local CPU processing. Originals remain in KV. Masked copies go to a separate prefix and follow the batch retention period.'
+                  : 'Workers KV is not configured yet. Local inbox processing works offline. To enable cloud storage, configure a Workers KV namespace and a scoped API token in the backend .env file. Free-plan quotas apply; the model and OCR processing continue on this computer.'}
+              </div>
+              {kvStoredUpload && (
+                <div className="batch-import-feedback" aria-live="polite">
+                  Stored {kvStoredUpload.uploaded_count} files in Workers KV. Masking has not started. In Cloudflare, open the KV Pairs tab and search this key prefix: <code>{kvStoredUpload.storage_prefix}</code>. Return here and click "Process uploaded KV files" when ready.
+                </div>
+              )}
+              {folderImportBusy && <div className="batch-import-feedback">{folderImportAction}...</div>}
+              {folderImportError && <div className="batch-import-feedback is-error">{folderImportError}</div>}
+              {folderBatch && (
+                <div className="batch-import-result" aria-live="polite">
+                  <div className="batch-import-result-heading">
+                    <b>{folderBatch.import_label || 'Folder import'}</b>
+                    <span>{folderBatch.status === 'completed' || folderBatch.status === 'completed_with_issues' ? 'Finished' : `${folderBatch.completed_files || 0} of ${folderBatch.total_files} masked`}</span>
+                  </div>
+                  <p>{folderBatch.total_files} files · {folderBatch.rejected_files || 0} rejected · {folderBatch.failed_files || 0} failed</p>
+                  <ul>
+                    {folderBatch.files?.map((item) => (
+                      <li key={item.file_id}>
+                        <div className="batch-file-info">
+                          <span>{item.file_name}</span>
+                          {(item.output_storage_uri || item.output_s3_uri) && <small className="batch-file-storage">Private cloud copy: {item.output_storage_uri || item.output_s3_uri}</small>}
+                        </div>
+                        <b className={`batch-file-state state-${item.status}`}>{item.status}</b>
+                      </li>
+                    ))}
+                  </ul>
+                  {folderBatch.download_zip_url && (
+                    <a className="download-result-button batch-import-download" href={folderBatch.download_zip_url} download>
+                      Download masked PDFs and manifest <Icon name="arrow" size={14}/>
+                    </a>
+                  )}
+                </div>
+              )}
+            </div>
+          </details>
 
           {!files.length ? (
             <div className="workspace-grid">

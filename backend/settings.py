@@ -66,7 +66,9 @@ class Settings:
                 "AADHAAR_NUMBER_MODEL",
                 DEFAULT_MODEL_DIR / "aadhaar-number-det.pt",
             ),
-            yolo_device=os.getenv("AADHAAR_YOLO_DEVICE", "cpu"),
+            # Runtime inference is deliberately CPU-only for predictable,
+            # bounded local batch processing. GPU selection is not exposed.
+            yolo_device="cpu",
             document_confidence=_env_float("AADHAAR_DOCUMENT_CONFIDENCE", 0.72),
             number_confidence=_env_float("AADHAAR_NUMBER_CONFIDENCE", 0.62),
             document_iou=_env_float("AADHAAR_DOCUMENT_IOU", 0.45),

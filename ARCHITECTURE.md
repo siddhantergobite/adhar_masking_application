@@ -81,7 +81,7 @@ Main file: `src/App.jsx`
 
 ### Vite
 
-Vite provides the development server and production frontend bundle. In development it proxies `/api` requests to FastAPI on port 8001.
+Vite provides the development server and production frontend bundle. In development it proxies `/api` requests to FastAPI on port 8002.
 
 Commands:
 
@@ -102,10 +102,15 @@ Mammoth produces a browser preview for DOCX uploads. DOMPurify sanitizes that ge
 
 ### FastAPI
 
-FastAPI exposes two endpoints:
+FastAPI exposes readiness and single-file endpoints, plus a CPU-only batch API:
 
 - `GET /api/health`: model and OCR readiness.
 - `POST /api/process`: multipart upload and masked PDF response.
+- `POST /api/batches`: queue up to 30 multipart files.
+- `POST /api/batches/folder`: queue files from the configured local input root.
+- `POST /api/batches/s3`: optionally queue files from a configured S3 prefix.
+- `GET /api/batches/{batch_id}`: get batch and per-file status.
+- `GET /api/batches/{batch_id}/download.zip`: download completed PDFs and a manifest.
 
 Main file: `backend/server.py`
 
@@ -125,7 +130,7 @@ Important response headers include:
 Uvicorn runs the ASGI service locally:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8001 --no-access-log
+.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8002 --workers 1 --no-access-log
 ```
 
 Access logging is disabled in the documented command so routine logs do not retain private filenames.
@@ -432,7 +437,8 @@ Current controls:
 
 - local backend by default;
 - no cloud OCR or hosted inference call;
-- source bytes kept only for the request;
+- single-file source bytes kept only for the request; batch inputs are staged temporarily and removed after processing;
+- batch status and masked outputs stored locally for 24 hours by default, with optional S3 output storage;
 - temporary Word conversion directory;
 - no source/identifier logging in application code;
 - no routine Uvicorn access log in the documented command;
@@ -479,7 +485,8 @@ The application must never lower thresholds simply to make a difficult demo imag
 | `src/App.jsx` | React upload, preview, processing, error, download flow |
 | `src/style.css` | Landing/upload interface styling |
 | `src/processing.css` | Processing/result interface styling |
-| `backend/server.py` | FastAPI lifecycle, health, upload endpoint, response headers |
+| `backend/server.py` | FastAPI lifecycle, health, single-file and batch endpoints, response headers |
+| `backend/batches.py` | CPU batch queue, folder/S3 ingestion, SQLite job state, local output retention |
 | `backend/documents.py` | Image/PDF/Word decoding and flattened PDF creation |
 | `backend/detectors.py` | YOLO document and number model adapters |
 | `backend/candidates.py` | OpenCV quadrilateral proposals and deduplication |
@@ -511,7 +518,19 @@ AADHAAR_MAX_PAGES
 AADHAAR_MAX_PAGE_PIXELS
 AADHAAR_MIN_REGION_EDGE
 AADHAAR_MIN_BLUR_SCORE
+AADHAAR_BATCH_INPUT_ROOT
+AADHAAR_BATCH_STORAGE_ROOT
+AADHAAR_BATCH_MAX_FILES
+AADHAAR_BATCH_MAX_PENDING_FILES
+AADHAAR_BATCH_RETENTION_HOURS
+AADHAAR_BATCH_API_KEY
+AADHAAR_S3_INPUT_BUCKET
+AADHAAR_S3_INPUT_PREFIX
+AADHAAR_S3_OUTPUT_BUCKET
+AADHAAR_S3_OUTPUT_PREFIX
 ```
+
+Runtime inference is CPU-only, and the batch worker handles one file at a time. See [README.md](README.md#cpu-only-batch-api) for route details and local folder/S3 setup.
 
 The default local YOLO inference size is 640. The bootstrap models were trained at 384/512, and 640 avoids severe CPU contention with PaddleOCR while retaining appropriate model detail.
 
@@ -529,7 +548,7 @@ npm install
 Start FastAPI:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8001 --no-access-log
+.\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8002 --workers 1 --no-access-log
 ```
 
 Start React in a second terminal:

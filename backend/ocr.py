@@ -23,14 +23,31 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 def configure_cpu_threads() -> int:
-    """Use one consistent, bounded thread count for CPU inference."""
+    """Use one consistent, capped thread count for CPU inference."""
 
     default_threads = min(4, os.cpu_count() or 4)
-    cpu_threads = _positive_int_env("AADHAAR_OCR_CPU_THREADS", default_threads)
+    requested_threads = _positive_int_env("AADHAAR_OCR_CPU_THREADS", default_threads)
+    cpu_threads = min(requested_threads, default_threads, 4)
     # Set these before importing PyTorch/Paddle so their CPU runtimes do not
     # oversubscribe the laptop's cores. They are scoped to this service process.
     os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    # Apply the same cap to libraries that may otherwise create their own
+    # machine-wide thread pools. Import torch only after the environment caps
+    # are set, before Ultralytics initializes its models.
+    cv2.setNumThreads(cpu_threads)
+    try:
+        import torch
+
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # PyTorch only permits setting inter-op threads before parallel
+            # work starts. The intra-op cap above still applies if initialized.
+            pass
+    except ImportError:
+        pass
     return cpu_threads
 
 
