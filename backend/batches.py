@@ -172,6 +172,7 @@ class BatchManager:
                     document_count INTEGER NOT NULL DEFAULT 0,
                     masked_regions INTEGER NOT NULL DEFAULT 0,
                     masking_confidence INTEGER,
+                    masking_confidence_source TEXT,
                     document_classes TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -184,6 +185,14 @@ class BatchManager:
                     ON batch_files(status, created_at);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(batch_files)").fetchall()
+            }
+            if "masking_confidence_source" not in columns:
+                connection.execute(
+                    "ALTER TABLE batch_files ADD COLUMN masking_confidence_source TEXT"
+                )
 
     def pending_count(self) -> int:
         with self._connection() as connection:
@@ -311,7 +320,7 @@ class BatchManager:
             connection.execute(
                 """UPDATE batch_files SET status=?, error_code=?, error_message=?, output_path=?,
                    output_s3_uri=?, document_count=?, masked_regions=?, masking_confidence=?,
-                   document_classes=?, updated_at=?, completed_at=? WHERE id=?""",
+                   masking_confidence_source=?, document_classes=?, updated_at=?, completed_at=? WHERE id=?""",
                 (
                     status,
                     error_code,
@@ -321,6 +330,7 @@ class BatchManager:
                     int(metadata.get("document_count", 0)),
                     int(metadata.get("masked_regions", 0)),
                     metadata.get("masking_confidence"),
+                    metadata.get("masking_confidence_source"),
                     json.dumps(metadata.get("document_classes", [])),
                     _now(),
                     _now(),

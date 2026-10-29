@@ -23,6 +23,8 @@ function createFileItem(file) {
     documentConfidence: 0,
     verificationConfidence: 0,
     confidenceScore: null,
+    confidenceSource: 'none',
+    confidenceReason: '',
     summary: '',
     summarySource: '',
     summaryRequestId: '',
@@ -41,7 +43,7 @@ function fallbackSummary(payload) {
   if (payload.outcome === 'success') {
     const docs = `${payload.document_count} Aadhaar document${payload.document_count === 1 ? '' : 's'}`;
     const regions = `${payload.masked_regions} number line${payload.masked_regions === 1 ? '' : 's'}`;
-    const score = Number.isFinite(payload.pipeline_score) ? ` Evidence-weighted masking confidence score: ${payload.pipeline_score}/100.` : '';
+    const score = Number.isFinite(payload.pipeline_score) ? ` Local pipeline evidence score: ${payload.pipeline_score}/100.` : '';
     return `The local checks accepted a masked copy for ${docs} and redacted ${regions}.${score}`;
   }
   if (payload.outcome === 'rejected') return 'No safe masked copy was produced, so this file needs review or a clearer upload.';
@@ -51,8 +53,8 @@ function fallbackSummary(payload) {
 function ConfidenceSummary({ item }) {
   const settled = item.status === 'done' || item.status === 'error';
   const summary = item.summary || (settled ? 'Preparing a short result summary…' : 'A short summary will appear after processing.');
-  const sourceLabel = item.summarySource === 'gpt-5-nano'
-    ? 'GPT-5-nano'
+  const sourceLabel = item.summarySource === 'azure_openai'
+    ? 'Azure AI'
     : item.summarySource === 'local'
       ? 'Local summary'
       : '';
@@ -63,6 +65,7 @@ function ConfidenceSummary({ item }) {
         {sourceLabel && <small>{sourceLabel}</small>}
       </div>
       <p>{summary}</p>
+      {item.confidenceReason && <small className="confidence-reason">{item.confidenceReason}</small>}
     </section>
   );
 }
@@ -73,15 +76,22 @@ function ConfidenceGauge({ item }) {
   const circumference = 2 * Math.PI * 34;
   const offset = score === null ? circumference : circumference * (1 - score / 100);
   const tone = score === null ? 'unknown' : score >= 80 ? 'green' : score >= 60 ? 'amber' : 'low';
-  const reading = score === null ? (settled ? '—' : '…') : score;
-  const scoreDescription = score === null ? (settled ? 'not scored' : 'pending') : `${score} out of 100`;
+  const scoringPending = item.status === 'done' && item.confidenceSource === 'pending';
+  const reading = score === null ? (settled && !scoringPending ? '—' : '…') : score;
+  const scoreDescription = score === null
+    ? (settled && !scoringPending ? 'not scored' : 'pending')
+    : `${score} out of 100`;
+  const scoreSource = item.confidenceSource === 'azure_openai' ? 'Azure AI' : 'pipeline';
+  const scoreMethod = item.confidenceSource === 'azure_openai'
+    ? 'Azure AI assessment of per-document blur, boundary, OCR, verification, and masking evidence.'
+    : 'Local evidence score from per-document detection, scan quality, OCR, verification, and masking checks.';
 
   return (
     <div
       className={`confidence-gauge confidence-gauge-${tone}`}
       role="img"
       aria-label={`End-to-end masking confidence score ${scoreDescription}`}
-      title="Evidence-weighted score from boundary detection, scan quality, OCR, Aadhaar identity checks, and number-region corroboration. A missing number-detector match is neutral because OCR word boxes locate the mask. Digit-position checks and the post-mask OCR audit must pass before a file is returned. This is a pipeline score, not a probability. Rejected or unfinished files have no score because there is no masked result to assess."
+      title={`${scoreMethod} The local post-mask OCR audit must pass before a file is returned. This is an operational score, not a probability.`}
     >
       <svg viewBox="0 0 88 88" aria-hidden="true">
         <circle className="confidence-gauge-track" cx="44" cy="44" r="34" />
@@ -99,7 +109,7 @@ function ConfidenceGauge({ item }) {
         <strong>{reading}</strong>
         {score !== null && <span>/100</span>}
       </div>
-      <small>{score === null ? (settled ? 'not scored' : 'pending') : 'pipeline'}</small>
+      <small>{score === null ? (settled && !scoringPending ? 'not scored' : 'pending') : scoreSource}</small>
     </div>
   );
 }
@@ -197,7 +207,14 @@ function BatchApp() {
   const cancelledIdsRef = useRef(new Set());
 
   async function requestCardSummary(id, requestId, payload) {
-    let result = { summary: fallbackSummary(payload), source: 'local' };
+    const localScore = Number.isFinite(payload.pipeline_score) ? payload.pipeline_score : null;
+    let result = {
+      summary: fallbackSummary(payload),
+      source: 'local',
+      confidenceScore: localScore,
+      confidenceSource: localScore === null ? 'none' : 'pipeline',
+      confidenceReason: '',
+    };
     try {
       const response = await fetch('/api/card-summary', {
         method: 'POST',
@@ -206,15 +223,30 @@ function BatchApp() {
       });
       if (response.ok) {
         const candidate = await response.json();
-        if (typeof candidate.summary === 'string' && candidate.summary.trim()) {
-          result = { summary: candidate.summary, source: candidate.source === 'gpt-5-nano' ? 'gpt-5-nano' : 'local' };
-        }
+        const hasScore = Number.isFinite(candidate.confidence_score);
+        const validConfidenceSource = ['azure_openai', 'pipeline', 'none'].includes(candidate.confidence_source);
+        result = {
+          summary: typeof candidate.summary === 'string' && candidate.summary.trim()
+            ? candidate.summary
+            : result.summary,
+          source: candidate.source === 'azure_openai' ? 'azure_openai' : 'local',
+          confidenceScore: hasScore ? Math.max(0, Math.min(100, candidate.confidence_score)) : result.confidenceScore,
+          confidenceSource: validConfidenceSource ? candidate.confidence_source : result.confidenceSource,
+          confidenceReason: typeof candidate.confidence_reason === 'string' ? candidate.confidence_reason : '',
+        };
       }
     } catch {
       // Keep the card useful when Azure credentials or network access are unavailable.
     }
     setFiles((current) => current.map((candidate) => candidate.id === id && candidate.summaryRequestId === requestId
-      ? { ...candidate, summary: result.summary, summarySource: result.source }
+      ? {
+        ...candidate,
+        summary: result.summary,
+        summarySource: result.source,
+        confidenceScore: result.confidenceScore,
+        confidenceSource: result.confidenceSource,
+        confidenceReason: result.confidenceReason,
+      }
       : candidate));
   }
 
@@ -238,6 +270,8 @@ function BatchApp() {
       status: 'error',
       error: message,
       confidenceScore: null,
+      confidenceSource: 'none',
+      confidenceReason: '',
       summary: 'Preparing a short result summary…',
       summarySource: '',
       summaryRequestId: requestId,
@@ -413,6 +447,8 @@ function BatchApp() {
       status: 'queued',
       error: '',
       confidenceScore: null,
+      confidenceSource: 'none',
+      confidenceReason: '',
       summary: '',
       summarySource: '',
       summaryRequestId: '',
@@ -478,6 +514,14 @@ function BatchApp() {
       const documentCount = Number(response.headers.get('X-Aadhaar-Documents') || 0);
       const maskedCount = Number(response.headers.get('X-Redacted-Regions') || 0);
       const documentClasses = (response.headers.get('X-Document-Classes') || '').split(',').filter(Boolean);
+      let documentEvidence = [];
+      try {
+        const evidenceHeader = response.headers.get('X-Confidence-Evidence');
+        const parsedEvidence = evidenceHeader ? JSON.parse(evidenceHeader) : [];
+        if (Array.isArray(parsedEvidence)) documentEvidence = parsedEvidence;
+      } catch {
+        // Keep the local score if optional per-document evidence is unavailable.
+      }
       const requestId = `${item.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const summaryPayload = {
         outcome: 'success',
@@ -487,6 +531,7 @@ function BatchApp() {
         document_confidence: documentConfidence,
         verification_confidence: verificationConfidence,
         pipeline_score: Number.isFinite(confidenceScore) ? confidenceScore : null,
+        document_evidence: documentEvidence,
       };
       setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
         ...candidate,
@@ -498,7 +543,9 @@ function BatchApp() {
         documentClasses,
         documentConfidence,
         verificationConfidence,
-        confidenceScore: Number.isFinite(confidenceScore) ? Math.max(0, Math.min(100, confidenceScore)) : null,
+        confidenceScore: null,
+        confidenceSource: 'pending',
+        confidenceReason: '',
         summary: 'Preparing a short result summary…',
         summarySource: '',
         summaryRequestId: requestId,
@@ -603,6 +650,11 @@ function BatchApp() {
                       <li key={item.file_id}>
                         <div className="batch-file-info">
                           <span>{item.file_name}</span>
+                          {Number.isFinite(item.masking_confidence) && (
+                            <small className="batch-file-confidence">
+                              {item.masking_confidence_source === 'azure_openai' ? 'Azure AI' : 'Pipeline'} confidence {item.masking_confidence}/100
+                            </small>
+                          )}
                           {(item.output_storage_uri || item.output_s3_uri) && <small className="batch-file-storage">Private cloud copy: {item.output_storage_uri || item.output_s3_uri}</small>}
                         </div>
                         <b className={`batch-file-state state-${item.status}`}>{item.status}</b>

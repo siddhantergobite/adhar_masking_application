@@ -438,6 +438,7 @@ class AadhaarPipeline:
                 scan_quality_score=scan_quality_score,
                 ocr_confidence=min(line.confidence for line in valid_lines),
                 number_detector_confidence=number_detector_confidence,
+                raw_blur_score=quality_score,
             )
 
         if not saw_aadhaar_identity:

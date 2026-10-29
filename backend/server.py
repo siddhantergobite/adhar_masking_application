@@ -21,7 +21,13 @@ from .configuration import load_project_environment
 load_project_environment()
 
 from . import cloudflare_kv
-from .ai_summary import CardSummaryRequest, confidence_score, pipeline_confidence_score, summarize_card_result
+from .ai_summary import (
+    CardSummaryRequest,
+    confidence_evidence_for_result,
+    confidence_score,
+    pipeline_confidence_score,
+    summarize_card_result,
+)
 from .batches import (
     SUPPORTED_EXTENSIONS,
     BatchManager,
@@ -84,6 +90,7 @@ def serialize_batch(manager: BatchManager, batch_id: str) -> dict[str, Any]:
             "document_classes": json.loads(item["document_classes"] or "[]"),
             "masked_regions": item["masked_regions"],
             "masking_confidence": item["masking_confidence"],
+            "masking_confidence_source": item["masking_confidence_source"],
             "output_s3_uri": item["output_s3_uri"],
             "output_storage_uri": item["output_s3_uri"],
             "download_url": (
@@ -126,6 +133,7 @@ async def _process_batch_input(
     classes = sorted({document.document_class for document in result.documents})
     minimum_document_confidence = min(document.document_confidence for document in result.documents)
     minimum_verification_confidence = min(document.verification_confidence for document in result.documents)
+    document_evidence = confidence_evidence_for_result(result, settings.min_blur_score)
     score_request = CardSummaryRequest(
         outcome="success",
         document_count=len(result.documents),
@@ -134,12 +142,15 @@ async def _process_batch_input(
         document_confidence=minimum_document_confidence,
         verification_confidence=minimum_verification_confidence,
         pipeline_score=pipeline_confidence_score(result),
+        document_evidence=document_evidence,
     )
+    confidence_assessment = await run_in_threadpool(summarize_card_result, score_request)
     return flattened_pdf, {
         "document_count": len(result.documents),
         "document_classes": classes,
         "masked_regions": result.masked_regions,
-        "masking_confidence": confidence_score(score_request),
+        "masking_confidence": confidence_assessment["confidence_score"],
+        "masking_confidence_source": confidence_assessment["confidence_source"],
     }
 
 
@@ -307,6 +318,7 @@ async def process_document(file: UploadFile = File(...)) -> Response:
     ]
     minimum_number_detector_confidence = min(number_detector_scores) if number_detector_scores else None
     pipeline_score = pipeline_confidence_score(result)
+    document_evidence = confidence_evidence_for_result(result, settings.min_blur_score)
     score_request = CardSummaryRequest(
         outcome="success",
         document_count=len(result.documents),
@@ -315,6 +327,7 @@ async def process_document(file: UploadFile = File(...)) -> Response:
         document_confidence=minimum_document_confidence,
         verification_confidence=minimum_verification_confidence,
         pipeline_score=pipeline_score,
+        document_evidence=document_evidence,
     )
     return Response(
         content=flattened_pdf,
@@ -335,6 +348,7 @@ async def process_document(file: UploadFile = File(...)) -> Response:
                 else "not_matched"
             ),
             "X-Masking-Confidence": str(confidence_score(score_request)),
+            "X-Confidence-Evidence": json.dumps(document_evidence, separators=(",", ":")),
             "Cache-Control": "no-store, private",
             "Pragma": "no-cache",
             "X-Content-Type-Options": "nosniff",

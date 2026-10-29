@@ -53,6 +53,7 @@ class ProcessedDocument:
     scan_quality_score: float = 0.0
     ocr_confidence: float = 0.0
     number_detector_confidence: float | None = None
+    raw_blur_score: float = 0.0
 
 
 @dataclass(frozen=True)
