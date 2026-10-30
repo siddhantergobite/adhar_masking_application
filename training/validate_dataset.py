@@ -49,6 +49,7 @@ def audit(root: Path, *, task: str, class_count: int) -> None:
         if not split_images:
             raise ValueError(f"No images found in {image_dir}")
         split_negatives = 0
+        split_class_totals: Counter[int] = Counter()
         for image_path in split_images:
             with Image.open(image_path) as image:
                 image.verify()
@@ -58,10 +59,19 @@ def audit(root: Path, *, task: str, class_count: int) -> None:
             counts = validate_label(label_path, task=task, class_count=class_count)
             if not counts:
                 split_negatives += 1
+            split_class_totals.update(counts)
             class_totals.update(counts)
+        missing_classes = sorted(set(range(class_count)) - set(split_class_totals))
+        if missing_classes:
+            raise ValueError(f"{split} split is missing labeled classes: {missing_classes}")
+        if split_negatives == 0:
+            raise ValueError(f"{split} split has no hard-negative images with empty labels")
         total_images += len(split_images)
         total_negatives += split_negatives
-        print(f"{split}: {len(split_images)} images, {split_negatives} hard negatives")
+        print(
+            f"{split}: {len(split_images)} images, {split_negatives} hard negatives, "
+            f"class labels {dict(split_class_totals)}"
+        )
     if total_negatives == 0:
         raise ValueError("No hard-negative images were found. Non-Aadhaar and mixed-card scenes are required.")
     print(f"total: {total_images} images, {total_negatives} hard negatives, labels {dict(class_totals)}")

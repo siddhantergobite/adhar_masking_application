@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { DisplayErrorBoundary, DocumentPreview, fileKind, humanSize, Icon } from './App.jsx';
 
 const PROCESS_TIMEOUT_MS = 90_000;
+// The local workbench submits one document at a time; the API also runs one worker.
+const LOCAL_PROCESS_CONCURRENCY = 1;
 const FILE_ACCEPT = 'image/*,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.heic,.heif,.pdf,.doc,.docx';
 
 function fileIdentity(file) {
@@ -19,15 +21,6 @@ function createFileItem(file) {
     maskedUrl: '',
     maskedCount: 0,
     documentCount: 0,
-    documentClasses: [],
-    documentConfidence: 0,
-    verificationConfidence: 0,
-    confidenceScore: null,
-    confidenceSource: 'none',
-    confidenceReason: '',
-    summary: '',
-    summarySource: '',
-    summaryRequestId: '',
     showMasked: false,
   };
 }
@@ -37,81 +30,6 @@ function statusLabel(item) {
   if (item.status === 'done') return 'Masked copy ready';
   if (item.status === 'error') return 'Needs attention';
   return 'Waiting in queue';
-}
-
-function fallbackSummary(payload) {
-  if (payload.outcome === 'success') {
-    const docs = `${payload.document_count} Aadhaar document${payload.document_count === 1 ? '' : 's'}`;
-    const regions = `${payload.masked_regions} number line${payload.masked_regions === 1 ? '' : 's'}`;
-    const score = Number.isFinite(payload.pipeline_score) ? ` Local pipeline evidence score: ${payload.pipeline_score}/100.` : '';
-    return `The local checks accepted a masked copy for ${docs} and redacted ${regions}.${score}`;
-  }
-  if (payload.outcome === 'rejected') return 'No safe masked copy was produced, so this file needs review or a clearer upload.';
-  return 'Processing did not finish, so confidence could not be measured.';
-}
-
-function ConfidenceSummary({ item }) {
-  const settled = item.status === 'done' || item.status === 'error';
-  const summary = item.summary || (settled ? 'Preparing a short result summary…' : 'A short summary will appear after processing.');
-  const sourceLabel = item.summarySource === 'azure_openai'
-    ? 'Azure AI'
-    : item.summarySource === 'local'
-      ? 'Local summary'
-      : '';
-  return (
-    <section className="confidence-summary" aria-label="Result summary">
-      <div className="confidence-summary-heading">
-        <span>Result summary</span>
-        {sourceLabel && <small>{sourceLabel}</small>}
-      </div>
-      <p>{summary}</p>
-      {item.confidenceReason && <small className="confidence-reason">{item.confidenceReason}</small>}
-    </section>
-  );
-}
-
-function ConfidenceGauge({ item }) {
-  const settled = item.status === 'done' || item.status === 'error';
-  const score = Number.isFinite(item.confidenceScore) ? item.confidenceScore : null;
-  const circumference = 2 * Math.PI * 34;
-  const offset = score === null ? circumference : circumference * (1 - score / 100);
-  const tone = score === null ? 'unknown' : score >= 80 ? 'green' : score >= 60 ? 'amber' : 'low';
-  const scoringPending = item.status === 'done' && item.confidenceSource === 'pending';
-  const reading = score === null ? (settled && !scoringPending ? '—' : '…') : score;
-  const scoreDescription = score === null
-    ? (settled && !scoringPending ? 'not scored' : 'pending')
-    : `${score} out of 100`;
-  const scoreSource = item.confidenceSource === 'azure_openai' ? 'Azure AI' : 'pipeline';
-  const scoreMethod = item.confidenceSource === 'azure_openai'
-    ? 'Azure AI assessment of per-document blur, boundary, OCR, verification, and masking evidence.'
-    : 'Local evidence score from per-document detection, scan quality, OCR, verification, and masking checks.';
-
-  return (
-    <div
-      className={`confidence-gauge confidence-gauge-${tone}`}
-      role="img"
-      aria-label={`End-to-end masking confidence score ${scoreDescription}`}
-      title={`${scoreMethod} The local post-mask OCR audit must pass before a file is returned. This is an operational score, not a probability.`}
-    >
-      <svg viewBox="0 0 88 88" aria-hidden="true">
-        <circle className="confidence-gauge-track" cx="44" cy="44" r="34" />
-        <circle
-          className="confidence-gauge-progress"
-          cx="44"
-          cy="44"
-          r="34"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
-          transform="rotate(-90 44 44)"
-        />
-      </svg>
-      <div className="confidence-gauge-reading">
-        <strong>{reading}</strong>
-        {score !== null && <span>/100</span>}
-      </div>
-      <small>{score === null ? (settled && !scoringPending ? 'not scored' : 'pending') : scoreSource}</small>
-    </div>
-  );
 }
 
 function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult }) {
@@ -152,7 +70,6 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
             </DisplayErrorBoundary>
           </div>
         )}
-        {(item.status !== 'done' || item.showMasked) && <ConfidenceGauge item={item}/>}
       </div>
 
       <div className="document-card-footer">
@@ -168,18 +85,15 @@ function DocumentCard({ item, index, total, onRemove, onRetry, onToggleResult })
 
         {item.status === 'done' ? (
           <div className="document-card-result">
-            <ConfidenceSummary item={item}/>
             <a className="download-result-button" href={item.maskedUrl} download={item.maskedFile.name}>Download masked PDF <Icon name="arrow" size={14}/></a>
           </div>
         ) : item.status === 'error' ? (
           <div className="document-card-result document-card-error">
-            <ConfidenceSummary item={item}/>
             <p>{item.error}</p>
             <button className="card-retry-button" type="button" onClick={() => onRetry(item.id)}>Try again <Icon name="arrow" size={14}/></button>
           </div>
         ) : (
           <div className="document-card-result document-card-progress">
-            <ConfidenceSummary item={item}/>
             <p>{item.status === 'processing' ? 'The private pipeline is identifying, verifying, and masking this document.' : 'This file will be processed automatically when the local service is ready.'}</p>
           </div>
         )}
@@ -202,81 +116,16 @@ function BatchApp() {
   const [queueTick, setQueueTick] = useState(0);
   const fileInputRef = useRef(null);
   const filesRef = useRef([]);
-  const processingIdRef = useRef(null);
+  const processingIdsRef = useRef(new Set());
   const abortControllersRef = useRef(new Map());
   const cancelledIdsRef = useRef(new Set());
 
-  async function requestCardSummary(id, requestId, payload) {
-    const localScore = Number.isFinite(payload.pipeline_score) ? payload.pipeline_score : null;
-    let result = {
-      summary: fallbackSummary(payload),
-      source: 'local',
-      confidenceScore: localScore,
-      confidenceSource: localScore === null ? 'none' : 'pipeline',
-      confidenceReason: '',
-    };
-    try {
-      const response = await fetch('/api/card-summary', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (response.ok) {
-        const candidate = await response.json();
-        const hasScore = Number.isFinite(candidate.confidence_score);
-        const validConfidenceSource = ['azure_openai', 'pipeline', 'none'].includes(candidate.confidence_source);
-        result = {
-          summary: typeof candidate.summary === 'string' && candidate.summary.trim()
-            ? candidate.summary
-            : result.summary,
-          source: candidate.source === 'azure_openai' ? 'azure_openai' : 'local',
-          confidenceScore: hasScore ? Math.max(0, Math.min(100, candidate.confidence_score)) : result.confidenceScore,
-          confidenceSource: validConfidenceSource ? candidate.confidence_source : result.confidenceSource,
-          confidenceReason: typeof candidate.confidence_reason === 'string' ? candidate.confidence_reason : '',
-        };
-      }
-    } catch {
-      // Keep the card useful when Azure credentials or network access are unavailable.
-    }
-    setFiles((current) => current.map((candidate) => candidate.id === id && candidate.summaryRequestId === requestId
-      ? {
-        ...candidate,
-        summary: result.summary,
-        summarySource: result.source,
-        confidenceScore: result.confidenceScore,
-        confidenceSource: result.confidenceSource,
-        confidenceReason: result.confidenceReason,
-      }
-      : candidate));
-  }
-
-  function reportFailure(id, message, reasonCode) {
-    const rejectionCodes = new Set(['no_aadhaar_detected', 'review_required', 'no_aadhaar_number']);
-    const outcome = rejectionCodes.has(reasonCode) ? 'rejected' : 'unavailable';
-    const requestId = `${id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const allowedCodes = ['no_aadhaar_detected', 'review_required', 'no_aadhaar_number', 'models_not_ready', 'ocr_failed', 'processing_failed', 'processing_timeout', 'unsupported_file', 'file_too_large'];
-    const payload = {
-      outcome,
-      document_count: 0,
-      masked_regions: 0,
-      document_classes: [],
-      document_confidence: null,
-      verification_confidence: null,
-      pipeline_score: null,
-      reason_code: allowedCodes.includes(reasonCode) ? reasonCode : 'processing_failed',
-    };
+  function reportFailure(id, message) {
     setFiles((current) => current.map((candidate) => candidate.id === id ? {
       ...candidate,
       status: 'error',
       error: message,
-      confidenceScore: null,
-      confidenceSource: 'none',
-      confidenceReason: '',
-      summary: 'Preparing a short result summary…',
-      summarySource: '',
-      summaryRequestId: requestId,
     } : candidate));
-    void requestCardSummary(id, requestId, payload);
   }
 
   useEffect(() => {
@@ -446,12 +295,6 @@ function BatchApp() {
       ...item,
       status: 'queued',
       error: '',
-      confidenceScore: null,
-      confidenceSource: 'none',
-      confidenceReason: '',
-      summary: '',
-      summarySource: '',
-      summaryRequestId: '',
       showMasked: false,
     } : item));
   }
@@ -461,11 +304,11 @@ function BatchApp() {
   }
 
   async function processFile(item) {
-    if (!item || engineStatus !== 'ready' || processingIdRef.current) return;
+    if (!item || engineStatus !== 'ready' || processingIdsRef.current.has(item.id)) return;
 
     const originalFile = item.originalFile ?? item.file;
     if (!originalFile) {
-      reportFailure(item.id, 'The original upload is no longer available. Please upload this file again.', 'processing_failed');
+      reportFailure(item.id, 'The original upload is no longer available. Please upload this file again.');
       return;
     }
 
@@ -476,7 +319,7 @@ function BatchApp() {
       controller.abort();
     }, PROCESS_TIMEOUT_MS);
 
-    processingIdRef.current = item.id;
+    processingIdsRef.current.add(item.id);
     abortControllersRef.current.set(item.id, controller);
     setFiles((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, status: 'processing', error: '' } : candidate));
 
@@ -505,34 +348,8 @@ function BatchApp() {
 
       const safeName = originalFile.name.replace(/\.[^.]+$/, '');
       const maskedFile = new File([blob], `${safeName}-masked.pdf`, { type: 'application/pdf' });
-      const documentConfidence = Number(response.headers.get('X-Document-Confidence') || 0);
-      const verificationConfidence = Number(response.headers.get('X-Verification-Confidence') || 0);
-      const scoreHeader = response.headers.get('X-Masking-Confidence');
-      const confidenceScore = scoreHeader === null
-        ? null
-        : Number(scoreHeader);
       const documentCount = Number(response.headers.get('X-Aadhaar-Documents') || 0);
       const maskedCount = Number(response.headers.get('X-Redacted-Regions') || 0);
-      const documentClasses = (response.headers.get('X-Document-Classes') || '').split(',').filter(Boolean);
-      let documentEvidence = [];
-      try {
-        const evidenceHeader = response.headers.get('X-Confidence-Evidence');
-        const parsedEvidence = evidenceHeader ? JSON.parse(evidenceHeader) : [];
-        if (Array.isArray(parsedEvidence)) documentEvidence = parsedEvidence;
-      } catch {
-        // Keep the local score if optional per-document evidence is unavailable.
-      }
-      const requestId = `${item.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const summaryPayload = {
-        outcome: 'success',
-        document_count: documentCount,
-        masked_regions: maskedCount,
-        document_classes: documentClasses,
-        document_confidence: documentConfidence,
-        verification_confidence: verificationConfidence,
-        pipeline_score: Number.isFinite(confidenceScore) ? confidenceScore : null,
-        document_evidence: documentEvidence,
-      };
       setFiles((current) => current.map((candidate) => candidate.id === item.id ? {
         ...candidate,
         status: 'done',
@@ -540,39 +357,33 @@ function BatchApp() {
         maskedUrl: nextUrl,
         maskedCount,
         documentCount,
-        documentClasses,
-        documentConfidence,
-        verificationConfidence,
-        confidenceScore: null,
-        confidenceSource: 'pending',
-        confidenceReason: '',
-        summary: 'Preparing a short result summary…',
-        summarySource: '',
-        summaryRequestId: requestId,
         // Show the safe result as soon as processing finishes.  The Original
         // tab remains available for an explicit comparison.
         showMasked: true,
         error: '',
       } : candidate));
-      void requestCardSummary(item.id, requestId, summaryPayload);
     } catch (error) {
       if (timedOut) {
-        reportFailure(item.id, 'Local processing exceeded 90 seconds. Try a clearer or more tightly framed document image.', 'processing_timeout');
+        reportFailure(item.id, 'Local processing exceeded 90 seconds. Try a clearer or more tightly framed document image.');
       } else if (error.name !== 'AbortError' && !cancelledIdsRef.current.has(item.id)) {
-        reportFailure(item.id, error.message || 'Could not reach the local processing service.', error.code || 'processing_failed');
+        reportFailure(item.id, error.message || 'Could not reach the local processing service.');
       }
     } finally {
       window.clearTimeout(timeoutId);
       abortControllersRef.current.delete(item.id);
-      if (processingIdRef.current === item.id) processingIdRef.current = null;
+      processingIdsRef.current.delete(item.id);
       setQueueTick((tick) => tick + 1);
     }
   }
 
   useEffect(() => {
-    if (engineStatus !== 'ready' || processingIdRef.current) return;
-    const nextItem = files.find((item) => item.status === 'queued');
-    if (nextItem) void processFile(nextItem);
+    if (engineStatus !== 'ready') return;
+    const availableSlots = LOCAL_PROCESS_CONCURRENCY - processingIdsRef.current.size;
+    if (availableSlots <= 0) return;
+    files
+      .filter((item) => item.status === 'queued' && !processingIdsRef.current.has(item.id))
+      .slice(0, availableSlots)
+      .forEach((item) => void processFile(item));
   }, [files, engineStatus, queueTick]);
 
   function handleDrop(event) {
@@ -650,11 +461,6 @@ function BatchApp() {
                       <li key={item.file_id}>
                         <div className="batch-file-info">
                           <span>{item.file_name}</span>
-                          {Number.isFinite(item.masking_confidence) && (
-                            <small className="batch-file-confidence">
-                              {item.masking_confidence_source === 'azure_openai' ? 'Azure AI' : 'Pipeline'} confidence {item.masking_confidence}/100
-                            </small>
-                          )}
                           {(item.output_storage_uri || item.output_s3_uri) && <small className="batch-file-storage">Private cloud copy: {item.output_storage_uri || item.output_s3_uri}</small>}
                         </div>
                         <b className={`batch-file-state state-${item.status}`}>{item.status}</b>

@@ -9,6 +9,7 @@ import numpy as np
 
 from .domain import OcrLine, OcrWord
 from .errors import OcrFailure
+from .geometry import enhance_for_ocr
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -51,7 +52,7 @@ def configure_cpu_threads() -> int:
     return cpu_threads
 
 
-def load_ocr_engine() -> Any:
+def load_ocr_engine(device: str = "cpu") -> Any:
     cpu_threads = configure_cpu_threads()
     batch_size = _positive_int_env("AADHAAR_OCR_BATCH_SIZE", 8)
 
@@ -64,7 +65,7 @@ def load_ocr_engine() -> Any:
         text_detection_model_name=os.getenv("AADHAAR_OCR_DETECTION_MODEL", "PP-OCRv5_mobile_det"),
         text_recognition_model_name=os.getenv("AADHAAR_OCR_RECOGNITION_MODEL", "en_PP-OCRv5_mobile_rec"),
         text_recognition_batch_size=batch_size,
-        device="cpu",
+        device=device,
         enable_mkldnn=True,
         cpu_threads=cpu_threads,
         use_doc_orientation_classify=False,
@@ -108,6 +109,7 @@ def read_ocr_lines(
     image_rgb: np.ndarray,
     *,
     max_long_edge: int | None = None,
+    enhance_after_resize: bool = False,
 ) -> list[OcrLine]:
     try:
         original_height, original_width = image_rgb.shape[:2]
@@ -126,6 +128,11 @@ def read_ocr_lines(
                     ),
                     interpolation=cv2.INTER_AREA,
                 )
+
+        # Keep the OCR-facing dimensions unchanged while avoiding a full-size
+        # CLAHE/sharpening pass on large rectified pages that are resized next.
+        if enhance_after_resize:
+            image_rgb = enhance_for_ocr(image_rgb)
 
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         predictions = engine.predict(input=image_bgr)

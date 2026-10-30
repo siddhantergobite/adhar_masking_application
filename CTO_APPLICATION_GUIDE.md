@@ -45,7 +45,7 @@ The important design principle is **defense in depth**. No single model is trust
 
 ### What is YOLO?
 
-YOLO means **You Only Look Once**. It is a family of one-stage computer-vision models that process an image in one inference flow and predict objects with their classes, confidence scores, and locations.
+YOLO means **You Only Look Once**. It is a family of one-stage computer-vision models that process an image in one inference flow and predict object classes, locations, and internal detection confidence values. The application keeps those values inside its detection and verification logic; it does not present them as document-quality scores.
 
 In this application, “YOLO” is the model family. The deployed implementation is Ultralytics YOLO with our own task-specific trained weights.
 

@@ -102,7 +102,7 @@ Mammoth produces a browser preview for DOCX uploads. DOMPurify sanitizes that ge
 
 ### FastAPI
 
-FastAPI exposes readiness and single-file endpoints, plus a CPU-only batch API:
+FastAPI exposes readiness and single-file endpoints, plus a database-backed local batch API:
 
 - `GET /api/health`: model and OCR readiness.
 - `POST /api/process`: multipart upload and masked PDF response.
@@ -114,15 +114,13 @@ FastAPI exposes readiness and single-file endpoints, plus a CPU-only batch API:
 
 Main file: `backend/server.py`
 
-The endpoint applies upload-size limits, page limits, type validation, serial processing, privacy headers, and structured errors.
+Each process serializes access to its own inference pipeline. Multiple Uvicorn processes can work on separate requests and atomically claim separate queued files from the same-host SQLite database. The endpoint applies upload-size limits, page limits, type validation, privacy headers, and structured errors.
 
 Important response headers include:
 
 - `X-Aadhaar-Documents`
 - `X-Redacted-Regions`
 - `X-Document-Classes`
-- `X-Document-Confidence`
-- `X-Verification-Confidence`
 - `Cache-Control: no-store, private`
 
 ### Uvicorn
@@ -486,7 +484,7 @@ The application must never lower thresholds simply to make a difficult demo imag
 | `src/style.css` | Landing/upload interface styling |
 | `src/processing.css` | Processing/result interface styling |
 | `backend/server.py` | FastAPI lifecycle, health, single-file and batch endpoints, response headers |
-| `backend/batches.py` | CPU batch queue, folder/S3 ingestion, SQLite job state, local output retention |
+| `backend/batches.py` | Durable same-host batch queue, folder/S3 ingestion, SQLite job state, local output retention |
 | `backend/documents.py` | Image/PDF/Word decoding and flattened PDF creation |
 | `backend/detectors.py` | YOLO document and number model adapters |
 | `backend/candidates.py` | OpenCV quadrilateral proposals and deduplication |
@@ -530,9 +528,9 @@ AADHAAR_S3_OUTPUT_BUCKET
 AADHAAR_S3_OUTPUT_PREFIX
 ```
 
-Runtime inference is CPU-only, and the batch worker handles one file at a time. See [README.md](README.md#cpu-only-batch-api) for route details and local folder/S3 setup.
+CPU is the default inference device; YOLO and OCR can use compatible CUDA builds when configured. Each Uvicorn process runs one queue consumer and can claim one file at a time. SQLite leases support recovery and multiple same-host processes. Optional PostgreSQL mode uses a shared job database with `SKIP LOCKED` claims, while private S3/R2 stores shared sources and masked outputs for workers on different hosts. See [README.md](README.md#multi-host-workers-with-postgresql-and-shared-s3r2) for setup. This workspace does not have the external services configured, so a target-environment integration run remains required.
 
-The default local YOLO inference size is 640. The bootstrap models were trained at 384/512, and 640 avoids severe CPU contention with PaddleOCR while retaining appropriate model detail.
+The default local YOLO inference size is 512. The bootstrap models were trained at 384/512, and 512 limits CPU contention with PaddleOCR while retaining model detail.
 
 ## 20. Running and testing
 
@@ -629,4 +627,4 @@ No responsible system can guarantee every blurred, cropped, or obstructed image.
 No. Current inference is local. Roboflow would be optional dataset tooling only.
 
 **Is it production-ready now?**  
-The code path is production-oriented and the supplied acceptance cases pass. A production claim still requires an independent consented real-world evaluation set, deployment security controls, performance testing, and licensing review.
+No. The local and optional distributed serving paths are implemented, but multi-host behavior still needs a target PostgreSQL/S3/R2 integration run, and the synthetic model weights need a locked, consented real-world evaluation. The deployment also needs a TLS identity gateway, rate limits, isolated document conversion, retention monitoring, performance results on target hardware, and licensing review.

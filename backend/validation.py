@@ -49,6 +49,16 @@ _PAN_IDENTITY_PHRASES = (
     "pan card",
     "form 49a",
 )
+_PAYMENT_CARD_IDENTITY_PHRASES = (
+    "visa",
+    "mastercard",
+    "master card",
+    "rupay",
+    "american express",
+    "amex",
+    "debit card",
+    "credit card",
+)
 
 
 def verhoeff_is_valid(number: str) -> bool:
@@ -113,6 +123,12 @@ def has_pan_identity_anchor(lines: list[OcrLine]) -> bool:
     """Recognize common PAN-card headings as negative Aadhaar evidence."""
     text = _normalise_text(lines)
     return any(phrase in text for phrase in _PAN_IDENTITY_PHRASES)
+
+
+def has_payment_card_anchor(lines: list[OcrLine]) -> bool:
+    """Identify explicit payment-card branding for a fast negative decision."""
+    text = _normalise_text(lines)
+    return any(phrase in text for phrase in _PAYMENT_CARD_IDENTITY_PHRASES)
 
 
 def qr_present(image_rgb: np.ndarray) -> bool:

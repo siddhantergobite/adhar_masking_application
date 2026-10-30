@@ -49,11 +49,12 @@ class Settings:
     pdf_scale: float
     min_region_edge: int
     min_blur_score: float
-    orientation_attempts: int = 2
+    orientation_attempts: int = 4
     ocr_max_long_edge: int = 960
     ocr_audit_max_long_edge: int = 1200
     document_fallback_confidence: float = 0.12
     number_fallback_confidence: float = 0.12
+    ocr_device: str = "cpu"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -66,9 +67,10 @@ class Settings:
                 "AADHAAR_NUMBER_MODEL",
                 DEFAULT_MODEL_DIR / "aadhaar-number-det.pt",
             ),
-            # Runtime inference is deliberately CPU-only for predictable,
-            # bounded local batch processing. GPU selection is not exposed.
-            yolo_device="cpu",
+            # CPU is the safe default. Set AADHAAR_YOLO_DEVICE=0 to use the
+            # first CUDA GPU for YOLO detection when a compatible runtime exists.
+            yolo_device=os.getenv("AADHAAR_YOLO_DEVICE", "cpu").strip() or "cpu",
+            ocr_device=os.getenv("AADHAAR_OCR_DEVICE", "cpu").strip() or "cpu",
             document_confidence=_env_float("AADHAAR_DOCUMENT_CONFIDENCE", 0.72),
             number_confidence=_env_float("AADHAAR_NUMBER_CONFIDENCE", 0.62),
             document_iou=_env_float("AADHAAR_DOCUMENT_IOU", 0.45),
@@ -84,15 +86,13 @@ class Settings:
             pdf_scale=float(os.getenv("AADHAAR_PDF_SCALE", "2.5")),
             min_region_edge=_env_int("AADHAAR_MIN_REGION_EDGE", 220, 80),
             min_blur_score=float(os.getenv("AADHAAR_MIN_BLUR_SCORE", "14.0")),
-            # Some phone photos arrive with a physically landscape card whose
-            # detected polygon is ordered 90 degrees off. Try all rotations
-            # by default; the OCR result is still checksum and layout gated.
+            # Try the shape-matched orientations first and stop as soon as
+            # verification succeeds. Difficult rotated crops can use the
+            # remaining orientations before the slower full-page fallback.
             orientation_attempts=min(_env_int("AADHAAR_ORIENTATION_ATTEMPTS", 4), 4),
-            # PaddleOCR is CPU-bound on the full rectified page. OCR boxes are
-            # mapped back to the full-resolution page before masking, so this
-            # only reduces OCR cost and does not reduce output quality.
-            # A smaller first-pass OCR image speeds up CPU inference. Keep the
-            # post-mask audit at a separate, higher resolution for safety.
+            # OCR boxes map back to full resolution before masking. The smaller
+            # first-pass OCR image limits inference work; keep the post-mask
+            # audit at a separate, higher resolution for safety.
             ocr_max_long_edge=_env_int("AADHAAR_OCR_MAX_LONG_EDGE", 960, 320),
             ocr_audit_max_long_edge=_env_int("AADHAAR_OCR_AUDIT_MAX_LONG_EDGE", 1200, 320),
             # The bootstrap YOLO weights are calibrated on clean material and

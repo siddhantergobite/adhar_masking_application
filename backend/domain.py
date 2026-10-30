@@ -49,6 +49,7 @@ class ProcessedDocument:
     document_confidence: float
     verification_confidence: float
     masked_regions: int
+    detection_source: str = "unknown"
     boundary_confidence: float = 0.0
     scan_quality_score: float = 0.0
     ocr_confidence: float = 0.0

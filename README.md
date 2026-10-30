@@ -9,7 +9,7 @@ For the detailed system design and recorded regression cases, see [ARCHITECTURE.
 ## What the app does
 
 - Accepts JPG/JPEG, PNG, WebP, BMP, TIFF, GIF, HEIC/HEIF, PDF, DOC, and DOCX files.
-- Accepts multiple files in one selection or by drag and drop. Files are queued and processed one at a time; they are not merged together.
+- Accepts multiple files in one selection or by drag and drop. Each file gets its own result; the local browser queue sends two files at a time.
 - Supports multi-page images and documents, up to 10 pages per file. The upload limit is 25 MiB per file.
 - Shows each file's original and masked preview, processing status, and a separate masked PDF download.
 - Rejects a file if it cannot safely identify and mask an Aadhaar number. A debit-card-only file is expected to produce no output.
@@ -29,9 +29,7 @@ DOC and DOCX processing requires LibreOffice on the computer running the API. Th
 
 The pipeline is designed to fail closed on uncertain, cut-off, blurry, or partially processed documents. The checksum checks number format; the application does not authenticate an identity or verify a number against UIDAI.
 
-Each result card also shows a conservative end-to-end pipeline score and a one- or two-sentence summary. For a successful file, the score is the weakest signal across document/boundary detection (including OpenCV agreement when available), scan quality relative to the configured blur threshold, OCR confidence for accepted number lines, Aadhaar verification, and number-region localization. Missing number-region support scores zero. The system returns a score only after digit-coordinate checks, masking, PDF creation, and the post-mask OCR audit pass; failures reject the file without a PDF. For multi-document files, the lowest document score is shown. This heuristic is not a calibrated probability of correctness and cannot prove OCR found every sensitive number. Calibrate it against human-reviewed, identity-disjoint examples before presenting it as a likelihood. A rejected file shows 0; an unavailable result shows “Not scored.”
-
-When Azure OpenAI is configured, GPT-5-nano summarizes only validated result metadata (outcome, document class, counts, and confidence signals). Images, filenames, OCR text, and Aadhaar numbers are not sent for summaries. If the model call is unavailable, the card displays a local summary instead.
+The result UI shows processing status and basic document/redaction counts. It does not display or return confidence scores. Local OCR, Aadhaar verification, digit-coordinate checks, masking, and the post-mask OCR audit remain internal safety gates.
 
 ## Model files
 
@@ -66,6 +64,7 @@ Open two PowerShell terminals in the project root.
 Terminal 1 - start the local API:
 
 ~~~powershell
+$env:AADHAAR_OCR_CPU_THREADS = "4"
 .\.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8002 --workers 1 --no-access-log
 ~~~
 
@@ -77,15 +76,13 @@ npm run dev
 
 Open the Vite URL printed in the second terminal. The current Vite configuration uses `http://127.0.0.1:5174/` and proxies `/api` requests to the API at `http://127.0.0.1:8002`.
 
-The API provides `GET /api/health` for readiness and `POST /api/process` for one uploaded file. The browser's multi-file queue sends each file in its own request. A successful response is a flattened PDF with `Cache-Control: no-store, private`. The backend's inference lock serializes processing on CPU. For folder or multi-file jobs, use the batch routes below.
+The API provides `GET /api/health` for readiness and `POST /api/process` for one uploaded file. The local browser sends one file at a time, and the documented one-worker API serializes model access. Four OCR CPU threads are available to speed up that one document. Additional Uvicorn workers and browser concurrency can process multiple files in parallel, at the cost of additional CPU and model memory. A successful response is a flattened PDF with `Cache-Control: no-store, private`.
 
-The browser also calls `POST /api/card-summary` with the validated, non-identifying result metadata described above. The Azure API key stays in the backend environment and is never sent to the browser.
+No confidence score is included in the single-file response or batch result. There is no external assessment call.
 
-If you do not already have a `.env`, copy `.env.example` to create one; otherwise, keep your existing credentials and add or update `AZURE_OPENAI_MODEL`. The setting must match the GPT-5-nano deployment name in your Azure resource. Keep `.env` local; it is ignored by Git.
+## Local batch API
 
-## CPU-only batch API
-
-The batch API accepts up to 30 supported files per batch and processes them **one at a time on CPU**. It reuses the same Aadhaar verification, masking, and post-mask OCR safety checks as the single-file route. A batch returns a job ID immediately; use the status route to see progress and download completed outputs. Batch state is stored in SQLite under the local batch storage folder. Uploaded copies are removed after processing; masked outputs and the manifest are retained for 24 hours by default.
+The batch API accepts up to 30 supported files per batch and records jobs in a durable SQLite queue. Each Uvicorn process polls that queue and atomically claims one file; a lease lets another process retry work abandoned by a crashed worker, up to the configured attempt limit. The documented local profile uses one Uvicorn process, so it masks one file at a time. Additional workers can process files in parallel and require more CPU and model memory. All workers must use the same local batch storage root. Uploaded copies are removed after processing; masked outputs and the manifest are retained for 24 hours by default.
 
 The web app has a **Folder and Cloudflare Workers KV imports** panel. **Process local inbox** scans `AADHAAR_BATCH_INPUT_ROOT` directly, so a browser folder-upload control is not needed. Your configured inbox is `C:\Users\admin\Documents\AadhaarInbox`; the app scans its top level by default. You can store those local files in a private Workers KV namespace first, then separately import the stored files for local processing, or import values already stored under the KV inbox prefix.
 
@@ -101,7 +98,7 @@ Open the interactive API page at `http://127.0.0.1:8002/docs` while the local AP
 | `POST /api/batches/kv/store-folder` | Copy supported local inbox files to a private Workers KV prefix without starting masking. |
 | `POST /api/batches/kv` | Queue supported files from the configured Workers KV inbox prefix, optionally limited to a relative key prefix. |
 | `POST /api/batches/kv/upload-folder` | Store configured local inbox files in Workers KV and process them locally. |
-| `GET /api/batches/{batch_id}` | Check batch and per-file status, rejection reason, score, and download links. |
+| `GET /api/batches/{batch_id}` | Check batch and per-file status, rejection reason, and download links. |
 | `GET /api/batches/{batch_id}/files/{file_id}/download` | Download one completed masked PDF. |
 | `GET /api/batches/{batch_id}/download.zip` | Download successful PDFs plus a JSON manifest of all file outcomes. |
 | `DELETE /api/batches/{batch_id}` | Delete a finished local batch and, when configured, its cloud output objects. |
@@ -171,21 +168,46 @@ Keep the three R2 prefixes separate. Restart the backend. The R2 routes remain a
 
 R2 keys must be kept private and should not be committed to source control. To give someone else temporary access to a result, use a controlled authenticated API or a short-lived presigned download URL; do not make the bucket public. The batch API currently returns private `s3://` object references for R2 outputs. Original objects remain in R2 until you delete them or apply a bucket lifecycle rule. Masked R2 outputs follow the batch retention setting and are removed after 24 hours by default; increase `AADHAAR_BATCH_RETENTION_HOURS` if the client needs a longer review window.
 
-Generic S3 support remains available: install `backend/requirements-s3.txt`, configure `AADHAAR_S3_INPUT_BUCKET` plus a non-empty `AADHAAR_S3_INPUT_PREFIX`, and call `POST /api/batches/s3`. Set `AADHAAR_S3_OUTPUT_BUCKET` to copy successful masked PDFs back to S3. S3 ingestion/output needs network access when used; direct upload and local-folder processing do not.
+Generic S3 support remains available: install `backend/requirements-s3.txt`, configure `AADHAAR_S3_INPUT_BUCKET` plus a non-empty `AADHAAR_S3_INPUT_PREFIX`, and call `POST /api/batches/s3`. Set `AADHAAR_S3_OUTPUT_BUCKET` to copy successful masked PDFs back to S3. S3 ingestion/output needs network access when used. In PostgreSQL mode, direct uploads and local-folder sources are also copied to shared object storage for remote workers.
 
-The defaults are 30 files per batch, 25 MiB per file, 750 MiB total per batch, 90 pending/processing files across batches, and 24-hour result retention. Override them with the corresponding `AADHAAR_BATCH_*` settings in `.env`. `AADHAAR_BATCH_API_KEY` optionally protects the batch routes with an `X-API-Key` header; it should be set before allowing clients beyond the local machine. The documented local API still binds to `127.0.0.1`; it is not a public hosted service.
+The defaults are 30 files per batch, 25 MiB per file, 750 MiB total per batch, 90 pending/processing files across batches, and 24-hour result retention. Override them with the corresponding `AADHAAR_BATCH_*` settings in `.env`. `AADHAAR_BATCH_API_KEY` optionally protects batch routes with `X-Batch-API-Key`; it should be set before allowing clients beyond the local machine. The documented local API still binds to `127.0.0.1`; it is not a public hosted service.
 
-CPU inference is enforced by the API; YOLO uses `cpu`, PaddleOCR uses CPU, PyTorch/OpenCV/Paddle thread settings are capped at four, and one batch worker processes a single file at a time. This bounds inference concurrency, but does not promise a completion time. Benchmark a representative set before setting a client SLA. The current model weights remain synthetic bootstrap weights and need real-world, consented evaluation before production use.
+YOLO uses CPU by default; set `AADHAAR_YOLO_DEVICE=0` to direct YOLO detection to the first CUDA GPU. Set `AADHAAR_OCR_DEVICE=gpu:0` to run PaddleOCR on that GPU. Both require compatible NVIDIA drivers and CUDA-enabled PyTorch/PaddlePaddle runtimes. The current local profile uses one Uvicorn worker, one browser request at a time, and `AADHAAR_OCR_CPU_THREADS=4` to use CPU cores within each document. In a same-image A/B check, four threads reduced successful response time relative to one thread; eight threads was slower. Earlier workstation measurements using two Uvicorn workers are recorded in `BENCHMARK_RESULTS.md`; they do not describe the current single-worker profile. Each process loads its own YOLO and OCR models, so memory use and startup time increase with worker count. Benchmark on the target hardware before choosing capacity. Current model weights remain synthetic bootstrap weights and need real-world, consented evaluation before production use.
+
+## Multi-host workers with PostgreSQL and shared S3/R2
+
+The default SQLite queue is durable and supports multiple Uvicorn processes on one host. Do not put the SQLite database on a network share. For API and inference workers on multiple hosts, set `AADHAAR_DATABASE_URL` to a managed PostgreSQL database and configure private shared object storage. Install both optional connectors:
+
+~~~powershell
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements-postgres.txt
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements-s3.txt
+~~~
+
+Configure `AADHAAR_DATABASE_URL`, `AADHAAR_S3_INPUT_BUCKET`, `AADHAAR_S3_INPUT_PREFIX`, `AADHAAR_S3_TEMP_PREFIX`, `AADHAAR_S3_OUTPUT_BUCKET`, and `AADHAAR_S3_OUTPUT_PREFIX` in a secret manager or ignored `.env`. With Cloudflare R2, the existing `CLOUDFLARE_R2_*` settings supply the bucket and credentials; keep the input, temporary-upload, and output prefixes separate. Generic AWS S3 can use the host's IAM role. Set `AADHAAR_DB_POOL_SIZE` per API process and size the managed database for the total pool count across every process.
+
+Every API and worker host must use the same database URL and shared buckets. Each host may keep its own local scratch directory. Direct upload and local-folder jobs stage their source in the temporary object prefix so a worker on any host can read it; the application removes those temporary objects after the job reaches a terminal state. User-managed S3/R2 and Workers KV originals are left in place. Masked outputs are stored in the shared output bucket and can be downloaded or zipped from any API host. PostgreSQL claims use row locks with `SKIP LOCKED`; leases recover jobs after worker loss and the attempt limit stops repeated crash loops.
+
+To run the PostgreSQL queue integration check against a disposable test database, set `AADHAAR_TEST_DATABASE_URL` and run:
+
+~~~powershell
+$env:AADHAAR_TEST_DATABASE_URL = $env:AADHAAR_DATABASE_URL
+.\.venv\Scripts\python.exe -m unittest backend.tests.test_postgres_integration -v
+~~~
+
+This workspace does not have a configured PostgreSQL/S3 deployment, so this multi-host mode still needs an integration run on the target services. API-key middleware is included; the deployment still needs a TLS gateway with user authentication, rate limits, isolated document conversion, and monitored retention/deletion. The synthetic checkpoints also need a locked, consented real-world evaluation before production use.
+
+For a production reverse-proxy deployment, set `AADHAAR_REQUIRE_API_KEY=true` and `AADHAAR_API_KEY` on the backend. The trusted gateway must authenticate users, keep the backend private, and inject `X-API-Key` on upstream requests. If `AADHAAR_BATCH_API_KEY` is set to a separate value, inject it as `X-Batch-API-Key` on batch routes as well. Never expose either secret in Vite/frontend code. The backend refuses to start if API-key enforcement is enabled without a configured key.
 
 ## Runtime configuration
 
-These environment variables can be used to configure the local service. Defaults below come from `backend/settings.py` and `backend/ocr.py`.
+These environment variables can be used to configure the service. Defaults below come from `backend/settings.py`, `backend/ocr.py`, and `backend/batches.py`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AADHAAR_DOCUMENT_MODEL` | `backend/models/aadhaar-document-seg.pt` | Document segmentation checkpoint path |
 | `AADHAAR_NUMBER_MODEL` | `backend/models/aadhaar-number-det.pt` | Number detector checkpoint path |
-| `AADHAAR_YOLO_DEVICE` | CPU, forced | Runtime YOLO inference is CPU-only; GPU selection is not exposed |
+| `AADHAAR_YOLO_DEVICE` | `cpu` | YOLO inference device; use `0` for the first CUDA GPU when configured |
+| `AADHAAR_OCR_DEVICE` | `cpu` | PaddleOCR device; use `gpu:0` with a compatible GPU-enabled PaddlePaddle runtime |
 | `AADHAAR_INFERENCE_SIZE` | `512` | YOLO inference image size |
 | `AADHAAR_DOCUMENT_CONFIDENCE` | `0.72` | Primary document detection confidence |
 | `AADHAAR_NUMBER_CONFIDENCE` | `0.62` | Primary number detection confidence |
@@ -200,17 +222,22 @@ These environment variables can be used to configure the local service. Defaults
 | `AADHAAR_OCR_DETECTION_MODEL` | `PP-OCRv5_mobile_det` | PaddleOCR text detection model |
 | `AADHAAR_OCR_RECOGNITION_MODEL` | `en_PP-OCRv5_mobile_rec` | PaddleOCR text recognition model |
 | `AADHAAR_OCR_BATCH_SIZE` | `8` | OCR recognition batch size |
-| `AADHAAR_OCR_CPU_THREADS` | Up to `4` | Shared CPU thread limit for PyTorch and PaddleOCR |
+| `AADHAAR_OCR_CPU_THREADS` | `4` (local default) | Per-process CPU thread cap for PyTorch and PaddleOCR |
+| `AADHAAR_BATCH_POLL_SECONDS` | `0.25` | Worker delay when no queued file is available |
+| `AADHAAR_BATCH_LEASE_SECONDS` | `300` | Time before an abandoned processing job can be retried |
+| `AADHAAR_BATCH_MAX_ATTEMPTS` | `3` | Maximum worker claims before a repeatedly crashed job fails |
+| `AADHAAR_DATABASE_URL` | unset | PostgreSQL connection string; enables shared multi-host job state when configured |
+| `AADHAAR_DB_POOL_SIZE` | `4` | Maximum PostgreSQL connections per Uvicorn process |
+| `AADHAAR_S3_TEMP_PREFIX` | `aadhaar/queued-input` | Shared object prefix for temporary direct/folder uploads in PostgreSQL mode |
+| `AADHAAR_REQUIRE_API_KEY` | `false` | Require `X-API-Key` on every API route; enable behind an authenticated gateway |
+| `AADHAAR_API_KEY` | unset | Secret required for all API routes when `AADHAAR_REQUIRE_API_KEY=true`; at least 32 characters |
+| `AADHAAR_BATCH_API_KEY` | unset | Optional second secret for batch routes, sent in `X-Batch-API-Key` when different from the global key |
 | `AADHAAR_MAX_UPLOAD_BYTES` | `26214400` | Maximum upload size in bytes (25 MiB) |
 | `AADHAAR_MAX_PAGES` | `10` | Maximum pages in one file |
 | `AADHAAR_MAX_PAGE_PIXELS` | `18000000` | Maximum decoded pixels per page |
 | `AADHAAR_PDF_SCALE` | `2.5` | PDF page rendering scale |
 | `AADHAAR_MIN_REGION_EDGE` | `220` | Minimum rectified document edge in pixels |
 | `AADHAAR_MIN_BLUR_SCORE` | `14.0` | Minimum blur score for acceptance |
-| `AZURE_OPENAI_ENDPOINT` | unset | Azure OpenAI resource endpoint used for short summaries only |
-| `AZURE_OPENAI_API_KEY` | unset | Backend-only Azure OpenAI credential |
-| `AZURE_OPENAI_MODEL` | `gpt-5-nano` | Azure deployment name for the summary model |
-
 Confidence and quality thresholds are safety controls. Calibrate them against a reviewed, identity-disjoint evaluation set; do not lower them just to make difficult examples pass.
 
 ## Developer commands
@@ -222,13 +249,28 @@ Run the existing backend unit tests and build the web app with:
 npm run build
 ~~~
 
+## Measure local throughput
+
+The local default is one Uvicorn worker, four OCR CPU threads, and one browser request at a time. For an explicit capacity comparison, temporarily restart with additional workers/threads and compare one and two simultaneous requests and queued batches against the same synthetic held-out document images. Use `--positive-label-dir` to exclude synthetic negative scenes; without it, the first sorted files may all be negatives. The report contains aggregate timing/status counts only; it does not print input filenames or OCR text. A batch run with concurrency 2 and six files submits 12 total jobs, within the default pending-job limit.
+
+Recorded measurements, setup, and limitations are in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+
+~~~powershell
+.\.venv\Scripts\python.exe -m backend.benchmark datasets\aadhaar-document-seg\images\test --positive-label-dir datasets\aadhaar-document-seg\labels\test --mode single --concurrency 1 --limit 6 --warmups 1
+.\.venv\Scripts\python.exe -m backend.benchmark datasets\aadhaar-document-seg\images\test --positive-label-dir datasets\aadhaar-document-seg\labels\test --mode single --concurrency 2 --limit 6 --warmups 1
+.\.venv\Scripts\python.exe -m backend.benchmark datasets\aadhaar-document-seg\images\test --positive-label-dir datasets\aadhaar-document-seg\labels\test --mode batch --concurrency 1 --limit 6 --warmups 0
+.\.venv\Scripts\python.exe -m backend.benchmark datasets\aadhaar-document-seg\images\test --positive-label-dir datasets\aadhaar-document-seg\labels\test --mode batch --concurrency 2 --limit 6 --warmups 0
+~~~
+
+Use real client timings only with approved, de-identified evaluation files. Compare the same input set after model warm-up; synthetic results measure code-path throughput, not production accuracy or an SLA. For a deployment target, run the same test on the target CPU/GPU, storage, and proxy with the expected mix and concurrency.
+
 ## Privacy and deployment
 
-- The documented local commands bind both services to `127.0.0.1`; image inference and masking use local YOLO checkpoints, OpenCV, and PaddleOCR. If configured, only result metadata is sent to Azure OpenAI to write the card summary.
+- The documented local commands bind both services to `127.0.0.1`; image inference and masking run locally. The app makes no LLM calls and does not display confidence scores.
 - The single-file API does not persist source uploads. Batch processing keeps a temporary copy until that file finishes, then removes it; masked batch outputs and status are retained locally for 24 hours by default.
 - The API command disables Uvicorn access logs so uploaded filenames are not recorded in routine request logs.
 - Do not add uploads, OCR text, or complete Aadhaar numbers to application logs, analytics, or error monitoring.
-- The optional `AADHAAR_BATCH_API_KEY` protects batch routes. Before exposing any part of the service on a network, add application-wide authentication, TLS, rate limits, request isolation, appropriate temporary storage controls, and a reviewed retention/deletion policy. Run LibreOffice conversion for untrusted files in an isolated worker or container. The current command binds to localhost and does not create a public hosted API.
+- For network deployment, require `AADHAAR_API_KEY` on all API routes and put the backend behind an authenticated TLS gateway that injects the key. The optional `AADHAAR_BATCH_API_KEY` can separately protect batch routes through `X-Batch-API-Key`. Add rate limits, request isolation, encrypted storage, and a reviewed retention/deletion policy. Run LibreOffice conversion for untrusted files in an isolated worker or container. The documented command binds to localhost and is not a public hosted API.
 - Review Ultralytics licensing before commercial deployment; see the [Ultralytics license page](https://www.ultralytics.com/license).
 
 ## Accuracy and release status

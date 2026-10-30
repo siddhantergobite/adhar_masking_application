@@ -7,6 +7,7 @@ import numpy as np
 from backend.domain import OcrLine
 from backend.validation import (
     extract_aadhaar_digits,
+    has_payment_card_anchor,
     verhoeff_check_digit,
     verhoeff_is_valid,
     verify_aadhaar,
@@ -33,6 +34,17 @@ class VerhoeffTests(unittest.TestCase):
     def test_payment_card_length_and_letters_are_rejected(self) -> None:
         self.assertIsNone(extract_aadhaar_digits("2222 3333 4444 5555"))
         self.assertIsNone(extract_aadhaar_digits("A234 5678 9012"))
+
+    def test_payment_card_brand_is_detected_as_negative_evidence(self) -> None:
+        payment_card = [
+            OcrLine(
+                text="VISA CREDIT CARD",
+                confidence=0.99,
+                polygon=np.array([[0, 0], [100, 0], [100, 20], [0, 20]], dtype=np.float32),
+            )
+        ]
+        self.assertTrue(has_payment_card_anchor(payment_card))
+        self.assertFalse(has_payment_card_anchor([]))
 
     def test_zero_or_one_prefix_is_rejected(self) -> None:
         for first in ("0", "1"):

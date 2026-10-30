@@ -1,6 +1,6 @@
 # System Architecture
 
-This diagram describes the current local development setup and the batch API. Document inference always runs on the local machine. Optional Workers KV and R2/S3 transfers require network access, while batch inference remains CPU-only and processes one file at a time.
+This diagram covers both the local same-host default and the optional multi-host mode. Local deployments use SQLite and local files. Multi-host deployments use PostgreSQL for shared job state and private S3/R2 for shared inputs and outputs. YOLO and PaddleOCR use CPU by default and can optionally use configured CUDA GPUs.
 
 ```mermaid
 flowchart LR
@@ -25,9 +25,9 @@ flowchart LR
             S3In[Optional POST /api/batches/s3<br/>import configured S3 prefix]
             R2In[Optional POST /api/batches/r2<br/>import private R2 inbox]
             R2Upload[Optional POST /api/batches/r2/upload-folder<br/>store inbox in private R2, then process]
-            Queue[One background worker<br/>processes one file at a time]
-            State[SQLite job/file status]
-            Store[Local job storage<br/>temporary inputs + masked PDFs]
+            Queue[One DB-polling worker<br/>per Uvicorn process]
+            State[SQLite default or PostgreSQL shared job/file status]
+            Store[Per-host scratch<br/>and temporary processing files]
             Status[GET status and download routes]
             Upload --> Queue
             Folder --> Queue
@@ -98,7 +98,8 @@ flowchart LR
         KVSource[Workers KV inbox prefix]
         KVOutput[Workers KV masked-output prefix]
         S3Source[Configured R2 inbox prefix]
-        S3Output[Configured R2 upload and masked-output prefixes]
+        S3Output[Private S3/R2 temporary-input and masked-output prefixes]
+        Postgres[Optional shared PostgreSQL<br/>leased job queue and batch metadata]
     end
 
     User --> UI
@@ -109,24 +110,28 @@ flowchart LR
     R2In -->|reads stored originals| S3Source
     R2Upload -->|copies local inbox originals| S3Output
     Store -->|copies masked results when configured| S3Output
+    Upload -->|PostgreSQL mode stores shared source objects| S3Output
+    Folder -->|PostgreSQL mode stages shared source objects| S3Output
+    Queue <-->|PostgreSQL mode| Postgres
 ```
 
 ## What happens in a batch
 
 1. Submit PDFs/images through `POST /api/batches`, process the configured local inbox with `POST /api/batches/folder`, or configure Workers KV. Use `POST /api/batches/kv/store-folder` to store inbox files without masking, then `POST /api/batches/kv` with its returned relative prefix to start processing; `POST /api/batches/kv/upload-folder` remains a one-call store-and-process option.
-2. The API creates a persistent batch ID and stores queued file status in SQLite.
-3. A single background worker processes each file using the same Aadhaar pipeline as `POST /api/process`. YOLO is set to CPU, PaddleOCR is set to CPU, and CPU library threads are capped at four.
+2. The API creates a persistent batch ID and stores queued file status in SQLite by default or PostgreSQL in multi-host mode.
+3. Each Uvicorn process polls the selected database and atomically claims one file. PostgreSQL workers use row locks with `SKIP LOCKED`; leases make abandoned jobs eligible for retry. Each process loads its own Aadhaar pipeline; configure CPU threads per process and benchmark the worker count on the target host.
 4. Each source is checked and decoded, Aadhaar is detected and verified, digits 1–8 are masked, and post-mask OCR checks that no full Aadhaar number remains.
 5. A safe result is saved as a flattened PDF. Uncertain or unsafe inputs are reported as rejected and do not get a masked PDF.
 6. Use `GET /api/batches/{batch_id}` to check progress and obtain download links. Download individual PDFs or all successful PDFs plus a JSON manifest. Workers KV stores originals and masked copies for KV batches; R2/S3 remains optional.
 
 ## Storage and network behavior
 
-- **Direct upload:** the API stages an input copy while it is queued/processing, then removes it. The original on the caller's computer is not changed.
+- **Direct upload:** the API stages an input copy while it is queued/processing, then removes it. In PostgreSQL mode the temporary source object is removed at terminal state. The original on the caller's computer is not changed.
 - **Local folder:** the API only reads below `AADHAAR_BATCH_INPUT_ROOT`, stages a copy, and leaves the original file in the inbox.
 - **Workers KV input:** the API reads only below the configured KV inbox prefix. Uploading a local inbox copies originals to the KV prefix and processes local staged copies. Originals remain in KV until manually deleted. These actions need network access.
-- **Masked output:** by default PDFs, batch status, and the manifest are kept under the local batch storage root for 24 hours. Set `AADHAAR_BATCH_STORAGE_ROOT` to choose a location. KV-batch masked copies are written under a separate KV output prefix and follow the batch retention period. Optional R2/S3 output remains supported.
+- **Masked output:** by default PDFs, batch status, and the manifest are kept under the local batch storage root for 24 hours. Set `AADHAAR_BATCH_STORAGE_ROOT` to choose a location. KV-batch masked copies are written under a separate KV output prefix and follow the batch retention period. In PostgreSQL mode, masked outputs are stored in shared S3/R2 and can be downloaded from any API host.
+- **Worker scaling:** SQLite plus local files supports multiple Uvicorn processes on one host. Multi-host mode uses a shared PostgreSQL queue and non-overlapping private S3/R2 input, temporary-upload, and output prefixes. The code path is covered by optional PostgreSQL integration tests; the external database/object-store deployment still needs a target-environment run.
 - **Local API address:** `http://127.0.0.1:8002/docs` is the interactive API page for the local development server. It is not a public hosted link.
-- **Optional summary:** `POST /api/card-summary` can use Azure OpenAI if configured. Batch processing does not call that service.
+- **Result scores:** No confidence score is displayed, returned by the API, or included in result manifests. Detection thresholds and verification signals remain internal safety gates.
 
-For setup commands, limits, request examples, and manual preparation, see [README.md](README.md#cpu-only-batch-api). The detailed recognition and masking sequence is in [SYSTEM_DIAGRAM.md](SYSTEM_DIAGRAM.md).
+For setup commands, limits, request examples, and manual preparation, see [README.md](README.md#local-batch-api). The detailed recognition and masking sequence is in [SYSTEM_DIAGRAM.md](SYSTEM_DIAGRAM.md).

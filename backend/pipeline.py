@@ -9,7 +9,6 @@ from .domain import NumberDetection, OcrLine, ProcessedDocument, ProcessingResul
 from .errors import NoAadhaarDetected, NoAadhaarNumber, UnsafeDocument
 from .geometry import (
     box_iou,
-    enhance_for_ocr,
     overlap_over_first,
     polygon_box,
     rectify_polygon,
@@ -23,6 +22,7 @@ from .validation import (
     extract_aadhaar_digits,
     has_aadhaar_identity_anchor,
     has_pan_identity_anchor,
+    has_payment_card_anchor,
     qr_present,
     verify_aadhaar,
 )
@@ -30,6 +30,10 @@ from .validation import (
 
 class _NotAadhaarCandidate(Exception):
     """Internal signal for a card-shaped object without Aadhaar identity text."""
+
+
+class _PaymentCardCandidate(_NotAadhaarCandidate):
+    """Explicit bank-card branding makes this candidate a safe negative."""
 
 
 class AadhaarPipeline:
@@ -63,67 +67,90 @@ class AadhaarPipeline:
             if primary_detections:
                 detections = self._refine_document_boundaries(primary_detections, proposals)
                 # Keep independent quadrilateral proposals available when a
-                # low-confidence YOLO hypothesis fails.  A proposal is still
-                # treated as untrusted by _process_detection; it can only
-                # produce output after the same Aadhaar verification checks.
+                # YOLO hypothesis fails. Proposals remain untrusted and must
+                # pass the same Aadhaar OCR and masking checks.
                 detections = self._deduplicate_documents([*detections, *proposals])
             elif using_geometric_fallback:
                 detections = proposals
             else:
                 detections = []
 
-            # When the strict YOLO result and the sole OpenCV proposal agree
-            # on one strong document boundary, the verified crop already has
+            # When the strong YOLO result and the sole OpenCV proposal agree
+            # enough to refine one document boundary, the verified crop has
             # independent geometry confirmation. Keep the full-page OCR pass
-            # for ambiguous scenes, multiple candidates, and weaker matches.
+            # for ambiguous scenes and multiple candidates.
             single_reconciled_candidate = (
                 len(primary_detections) == 1
                 and primary_detections[0].confidence >= self.settings.document_confidence
                 and len(proposals) == 1
                 and len(detections) == 1
-                and box_iou(primary_detections[0].box, proposals[0].box) >= 0.80
+                and box_iou(primary_detections[0].box, proposals[0].box) >= 0.55
             )
 
             # A model box can be valid Aadhaar identity evidence while still
             # clipping the physical page. Treat the complete image as a
             # last-chance candidate, after the learned/geometric candidates.
             page_results: list[ProcessedDocument] = []
-            page_failures: list[UnsafeDocument | NoAadhaarNumber] = []
-            page_has_aadhaar_back_without_number = False
+            page_failures: list[tuple[VisionDetection, UnsafeDocument | NoAadhaarNumber]] = []
+            page_aadhaar_backs_without_number: set[int] = set()
+            retry_candidates: list[VisionDetection] = []
+            payment_card_candidates = 0
             for detection in detections:
                 try:
                     result = self._process_detection(page, detection)
                     if result is not None:
                         page_results.append(result)
                     elif detection.class_name == "aadhaar_back":
-                        page_has_aadhaar_back_without_number = True
+                        page_aadhaar_backs_without_number.add(id(detection))
+                        if self._can_retry_orientation(detection):
+                            retry_candidates.append(detection)
+                except _PaymentCardCandidate:
+                    payment_card_candidates += 1
+                    continue
                 except _NotAadhaarCandidate:
                     # A card-shaped PAN or other document is not an Aadhaar
                     # failure. Ignore it so the final message says no Aadhaar
                     # was found when no Aadhaar candidate passes OCR checks.
+                    if self._can_retry_orientation(detection):
+                        retry_candidates.append(detection)
                     continue
                 except NoAadhaarNumber as exc:
                     # _process_detection raises this only after OCR finds
                     # Aadhaar-specific identity text.
                     if not using_geometric_fallback and detection.confidence >= self.settings.document_confidence:
-                        page_failures.append(exc)
+                        page_failures.append((detection, exc))
+                        if self._can_retry_orientation(detection):
+                            retry_candidates.append(detection)
                 except UnsafeDocument as exc:
                     # Non-Aadhaar proposals are filtered before this point;
                     # retain safety failures for any geometry source.
                     if not using_geometric_fallback and detection.confidence >= self.settings.document_confidence:
-                        page_failures.append(exc)
+                        page_failures.append((detection, exc))
+                        if self._can_retry_orientation(detection):
+                            retry_candidates.append(detection)
 
             # A verified crop is authoritative.  Running a full-frame rescue
             # after it succeeds can replace the crop with the entire camera
             # photo (for example, an Aadhaar beside a debit card).  Full-frame
             # recovery is only appropriate when no bounded candidate passed.
             fallback_failure: UnsafeDocument | NoAadhaarNumber | None = None
+            full_frame_result: ProcessedDocument | None = None
             used_full_frame_fallback = False
-            if self.document_proposer is not None and not page_results:
+            all_geometric_candidates_are_payment_cards = (
+                not primary_detections
+                and bool(detections)
+                and payment_card_candidates == len(detections)
+            )
+            if (
+                self.document_proposer is not None
+                and not page_results
+                and not all_geometric_candidates_are_payment_cards
+            ):
                 try:
                     fallback_result = self._process_detection(
                         page,
                         self._full_frame_detection(page),
+                        orientation_limit=4,
                     )
                 except _NotAadhaarCandidate:
                     fallback_result = None
@@ -139,7 +166,57 @@ class AadhaarPipeline:
                     # Aadhaar number outside the returned crop.
                     page_results = [fallback_result]
                     page_failures = []
+                    full_frame_result = fallback_result
                     used_full_frame_fallback = True
+
+            # Retry the remaining rotations only when a strong YOLO Aadhaar
+            # crop failed and the page itself still needs recovery. This keeps
+            # debit-card negatives and ordinary successful crops on the fast
+            # path while allowing a recovered crop to replace a wider page
+            # fallback when it found at least the same verified number lines.
+            if retry_candidates and (
+                page_failures
+                or full_frame_result is not None
+                or fallback_failure is not None
+                or page_aadhaar_backs_without_number
+            ):
+                for detection in retry_candidates:
+                    try:
+                        retry_result = self._process_detection(
+                            page,
+                            detection,
+                            orientation_offset=self._primary_orientation_attempts(),
+                            orientation_limit=4 - self._primary_orientation_attempts(),
+                        )
+                    except _PaymentCardCandidate:
+                        payment_card_candidates += 1
+                        page_failures = [
+                            entry for entry in page_failures if entry[0] is not detection
+                        ]
+                        page_aadhaar_backs_without_number.discard(id(detection))
+                        continue
+                    except (_NotAadhaarCandidate, NoAadhaarNumber, UnsafeDocument):
+                        continue
+                    if retry_result is None:
+                        continue
+
+                    page_failures = [
+                        entry for entry in page_failures if entry[0] is not detection
+                    ]
+                    page_aadhaar_backs_without_number.discard(id(detection))
+                    if full_frame_result is None:
+                        page_results.append(retry_result)
+                        continue
+
+                    keep_crop = retry_result.masked_regions >= full_frame_result.masked_regions
+                    preserve_tiled_page = (
+                        retry_result.masked_regions == full_frame_result.masked_regions
+                        and bool(page_aadhaar_backs_without_number)
+                        and self._detections_tile_page(primary_detections, page.shape)
+                    )
+                    if keep_crop and not preserve_tiled_page:
+                        page_results = [retry_result]
+                        used_full_frame_fallback = False
 
             if (
                 self.document_proposer is not None
@@ -152,38 +229,49 @@ class AadhaarPipeline:
                 # that the bounded crop missed an additional verified number.
                 # Equal-count results stay cropped so nearby debit cards and
                 # the surrounding camera scene never enter the PDF.
-                try:
-                    broader_result = self._process_detection(
-                        page,
-                        self._full_frame_detection(page),
-                    )
-                except (_NotAadhaarCandidate, NoAadhaarNumber, UnsafeDocument):
-                    broader_result = None
-                if (
+                broader_result = full_frame_result
+                if broader_result is None:
+                    try:
+                        broader_result = self._process_detection(
+                            page,
+                            self._full_frame_detection(page),
+                            audit_masked=False,
+                        )
+                    except (_NotAadhaarCandidate, NoAadhaarNumber, UnsafeDocument):
+                        broader_result = None
+                should_use_broader = (
                     broader_result is not None
                     and (
                         broader_result.masked_regions > page_results[0].masked_regions
                         or (
                             broader_result.masked_regions == page_results[0].masked_regions
-                            and page_has_aadhaar_back_without_number
+                            and bool(page_aadhaar_backs_without_number)
                             and self._detections_tile_page(primary_detections, page.shape)
                         )
                     )
-                ):
-                    page_results = [broader_result]
+                )
+                if should_use_broader and broader_result is not None:
+                    try:
+                        self._assert_no_readable_aadhaar_remains(broader_result.image)
+                    except UnsafeDocument:
+                        # The existing crop already passed its own audit. Match
+                        # prior behavior by discarding an unsafe broad copy.
+                        pass
+                    else:
+                        page_results = [broader_result]
 
             if page_results:
                 processed.extend(page_results)
                 detected_any = True
                 if page_failures:
-                    first_failure = first_failure or page_failures[0]
+                    first_failure = first_failure or page_failures[0][1]
             elif page_failures or fallback_failure is not None:
                 detected_any = True
                 if page_failures:
-                    first_failure = first_failure or page_failures[0]
+                    first_failure = first_failure or page_failures[0][1]
                 elif fallback_failure is not None:
                     first_failure = first_failure or fallback_failure
-            elif page_has_aadhaar_back_without_number:
+            elif page_aadhaar_backs_without_number:
                 detected_any = True
                 first_failure = first_failure or NoAadhaarNumber()
 
@@ -330,10 +418,25 @@ class AadhaarPipeline:
         already_expected = (width >= height) if expects_landscape else (height >= width)
         return (0, 2, 1, 3) if already_expected else (1, 3, 0, 2)
 
+    def _primary_orientation_attempts(self) -> int:
+        return max(1, min(4, int(getattr(self.settings, "orientation_attempts", 4))))
+
+    def _can_retry_orientation(self, detection: VisionDetection) -> bool:
+        return (
+            detection.source == "yolo"
+            and detection.class_name in {"aadhaar_front", "aadhaar_back", "aadhaar_letter"}
+            and detection.confidence >= self.settings.document_confidence
+            and self._primary_orientation_attempts() < 4
+        )
+
     def _process_detection(
         self,
         page: np.ndarray,
         detection: VisionDetection,
+        *,
+        orientation_offset: int = 0,
+        orientation_limit: int | None = None,
+        audit_masked: bool = True,
     ) -> ProcessedDocument | None:
         rectified = rectify_polygon(page, detection.polygon)
         quality_score = validate_region_quality(
@@ -358,18 +461,23 @@ class AadhaarPipeline:
         scan_quality_score = min(quality_score / blur_threshold, 1.0) if blur_threshold > 0 else 1.0
 
         orientation_order = self._orientation_order(rectified.image, detection.class_name)
-        orientation_attempts = max(1, min(4, int(getattr(self.settings, "orientation_attempts", 4))))
+        orientation_attempts = self._primary_orientation_attempts() if orientation_limit is None else max(
+            0, min(4, int(orientation_limit))
+        )
+        orientation_offset = max(0, min(4, int(orientation_offset)))
         ocr_max_long_edge = max(320, int(getattr(self.settings, "ocr_max_long_edge", 1200)))
-        for turns in orientation_order[:orientation_attempts]:
+        for turns in orientation_order[orientation_offset : orientation_offset + orientation_attempts]:
             oriented = rotate_quarter(rectified.image, turns)
-            enhanced = enhance_for_ocr(oriented)
             lines = read_ocr_lines(
                 self.ocr_engine,
-                enhanced,
+                oriented,
                 max_long_edge=ocr_max_long_edge,
+                enhance_after_resize=True,
             )
             valid_lines = self._valid_number_lines(lines)
             aadhaar_identity_anchor = has_aadhaar_identity_anchor(lines)
+            if has_payment_card_anchor(lines) and not aadhaar_identity_anchor:
+                raise _PaymentCardCandidate()
             if has_pan_identity_anchor(lines) and not aadhaar_identity_anchor:
                 continue
             if not aadhaar_identity_anchor and not valid_lines:
@@ -422,7 +530,8 @@ class AadhaarPipeline:
             for line in valid_lines:
                 mask_first_eight(masked, line)
 
-            self._assert_no_readable_aadhaar_remains(masked)
+            if audit_masked:
+                self._assert_no_readable_aadhaar_remains(masked)
             # OCR may need a quarter-turn to read a difficult capture, but
             # the returned document should stay in the rectified boundary's
             # canonical orientation. This also turns a rotated replacement
@@ -434,6 +543,7 @@ class AadhaarPipeline:
                 document_confidence=detection.confidence,
                 verification_confidence=verification.confidence,
                 masked_regions=len(valid_lines),
+                detection_source=detection.source,
                 boundary_confidence=boundary_confidence,
                 scan_quality_score=scan_quality_score,
                 ocr_confidence=min(line.confidence for line in valid_lines),
@@ -632,8 +742,9 @@ class AadhaarPipeline:
     def _assert_no_readable_aadhaar_remains(self, masked: np.ndarray) -> None:
         audit_lines = read_ocr_lines(
             self.ocr_engine,
-            enhance_for_ocr(masked),
+            masked,
             max_long_edge=max(320, int(getattr(self.settings, "ocr_audit_max_long_edge", 1200))),
+            enhance_after_resize=True,
         )
         if any(
             line.confidence >= self.settings.ocr_confidence

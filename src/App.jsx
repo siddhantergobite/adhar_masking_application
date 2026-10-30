@@ -247,8 +247,6 @@ function App() {
   const [maskedCount, setMaskedCount] = useState(0);
   const [documentCount, setDocumentCount] = useState(0);
   const [documentClasses, setDocumentClasses] = useState([]);
-  const [documentConfidence, setDocumentConfidence] = useState(0);
-  const [verificationConfidence, setVerificationConfidence] = useState(0);
   const [showMasked, setShowMasked] = useState(false);
   const fileInputRef = useRef(null);
   const processAbortRef = useRef(null);
@@ -289,8 +287,6 @@ function App() {
     setMaskedCount(0);
     setDocumentCount(0);
     setDocumentClasses([]);
-    setDocumentConfidence(0);
-    setVerificationConfidence(0);
     setShowMasked(false);
     setProcessError('');
     setProcessing(false);
@@ -304,8 +300,6 @@ function App() {
     setMaskedCount(0);
     setDocumentCount(0);
     setDocumentClasses([]);
-    setDocumentConfidence(0);
-    setVerificationConfidence(0);
     setShowMasked(false);
     setProcessError('');
     setProcessing(false);
@@ -349,8 +343,6 @@ function App() {
       setMaskedCount(Number(response.headers.get('X-Redacted-Regions') || 0));
       setDocumentCount(Number(response.headers.get('X-Aadhaar-Documents') || 0));
       setDocumentClasses((response.headers.get('X-Document-Classes') || '').split(',').filter(Boolean));
-      setDocumentConfidence(Number(response.headers.get('X-Document-Confidence') || 0));
-      setVerificationConfidence(Number(response.headers.get('X-Verification-Confidence') || 0));
       setShowMasked(true);
     } catch (error) {
       if (timedOut) {
@@ -482,7 +474,7 @@ function App() {
                     <div className="process-step"><span className="process-step-icon">03</span><div><b>Locate and mask</b><span>Number detector, OCR, checksum, safety audit</span></div><span className="step-state">{maskedFile ? 'Done' : 'Fail closed'}</span></div>
                   </div>
                   {maskedFile ? (
-                    <div className="engine-notice engine-success"><span className="engine-notice-dot"/><div><b>Detection and masking complete</b><span>{documentCount} Aadhaar document{documentCount === 1 ? '' : 's'} isolated; {maskedCount} number line{maskedCount === 1 ? '' : 's'} redacted.{documentClasses.length ? ` Detected: ${documentClasses.map((name) => name.replaceAll('_', ' ')).join(', ')}.` : ''} Minimum detector confidence {Math.round(documentConfidence * 100)}%, verification {Math.round(verificationConfidence * 100)}%. Review before sharing.</span></div></div>
+                    <div className="engine-notice engine-success"><span className="engine-notice-dot"/><div><b>Detection and masking complete</b><span>{documentCount} Aadhaar document{documentCount === 1 ? '' : 's'} isolated; {maskedCount} number line{maskedCount === 1 ? '' : 's'} redacted.{documentClasses.length ? ` Detected: ${documentClasses.map((name) => name.replaceAll('_', ' ')).join(', ')}.` : ''} Review before sharing.</span></div></div>
                   ) : processing ? (
                     <div className="engine-notice"><span className="engine-notice-dot"/><div><b>Detecting and verifying locally…</b><span>CPU processing is optimized and usually completes in under a minute; difficult images may take longer.</span></div></div>
                   ) : processError ? (

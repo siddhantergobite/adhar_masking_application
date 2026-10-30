@@ -1,0 +1,2 @@
+# Optional shared job database for multi-host deployments.
+psycopg[binary,pool]>=3.2,<4

@@ -56,8 +56,10 @@ The generated images are explicitly marked synthetic and contain no source Aadha
 Use a CUDA machine for serious training:
 
 ```powershell
-.\.venv\Scripts\python.exe training\train.py --task all --device 0 --epochs 150 --batch 8
+.\.venv\Scripts\python.exe training\train.py --task all --device auto --workers auto --cache ram --epochs 150 --batch 8
 ```
+
+`auto` selects CUDA when available and otherwise uses CPU. CUDA training enables mixed precision; the loader-worker count is sized from available logical cores. `--cache ram` speeds repeated epochs when the complete dataset fits comfortably in memory; use `--cache disk` for constrained RAM or `--cache none` for the safest default. Deterministic kernels are off by default for speed; add `--deterministic` when repeatable runs matter more than throughput.
 
 For a CPU-only bootstrap run:
 
@@ -65,7 +67,21 @@ For a CPU-only bootstrap run:
 .\.venv\Scripts\python.exe training\train.py --task all --device cpu --epochs 30 --batch 4 --workers 0 --document-imgsz 512 --number-imgsz 512
 ```
 
-The script validates the final checkpoints on the test split and copies them to:
+Training validates each candidate on the validation split and leaves it under `runs/` for review. It does not replace runtime weights automatically. Keep the identity-disjoint test split locked while iterating. After selecting a candidate, run the final test evaluation once; plotting is disabled so evaluation does not write sample images into the run folder:
+
+```powershell
+.\.venv\Scripts\python.exe training\evaluate_checkpoint.py documents runs\aadhaar-document-seg\weights\best.pt --confirm-final-test --device auto
+.\.venv\Scripts\python.exe training\evaluate_checkpoint.py numbers runs\aadhaar-number-det\weights\best.pt --confirm-final-test --device auto
+```
+
+Review hard-negative false detections, per-class recall, every-number masking recall, and unsafe-output rate on that locked set. Only then promote candidates with the separate command below. Existing runtime weights cannot be replaced unless the second flag is provided.
+
+```powershell
+.\.venv\Scripts\python.exe training\promote_checkpoint.py documents runs\aadhaar-document-seg\weights\best.pt --confirm-reviewed --replace-runtime-checkpoint
+.\.venv\Scripts\python.exe training\promote_checkpoint.py numbers runs\aadhaar-number-det\weights\best.pt --confirm-reviewed --replace-runtime-checkpoint
+```
+
+The reviewed checkpoints are copied atomically to:
 
 ```text
 backend/models/aadhaar-document-seg.pt

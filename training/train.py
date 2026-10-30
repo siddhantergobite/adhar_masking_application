@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import shutil
+import os
 from pathlib import Path
 
 from ultralytics import YOLO
 
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL_DIR = ROOT / "backend" / "models"
 
 
 def train_model(
@@ -16,7 +15,6 @@ def train_model(
     base_model: str,
     dataset: Path,
     run_name: str,
-    output_name: str,
     epochs: int,
     image_size: int,
     batch: int,
@@ -24,6 +22,8 @@ def train_model(
     workers: int,
     patience: int,
     freeze: int,
+    cache: str,
+    deterministic: bool,
     degrees: float,
     translate: float,
     scale: float,
@@ -45,8 +45,9 @@ def train_model(
         name=run_name,
         exist_ok=False,
         seed=42,
-        deterministic=True,
-        cache=False,
+        deterministic=deterministic,
+        amp=device != "cpu",
+        cache=False if cache == "none" else cache,
         degrees=degrees,
         translate=translate,
         scale=scale,
@@ -56,35 +57,56 @@ def train_model(
         mosaic=mosaic,
         close_mosaic=min(20, max(1, epochs // 4)) if mosaic > 0 else 0,
         freeze=freeze if freeze > 0 else None,
+        plots=False,
     )
     best = Path(metrics.save_dir) / "weights" / "best.pt"
     if not best.is_file():
         raise RuntimeError(f"Training completed without best.pt at {best}")
 
-    # Validate the exact checkpoint that will be deployed.
+    # Use the validation split during iteration. Keep the locked test split for
+    # the single final evaluation after a candidate has been selected.
     YOLO(str(best)).val(
         data=str(dataset),
         imgsz=image_size,
         batch=batch,
         device=device,
         workers=workers,
-        split="test",
+        split="val",
+        plots=False,
         project=str(ROOT / "runs"),
-        name=f"{run_name}-test",
+        name=f"{run_name}-validation",
     )
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    destination = MODEL_DIR / output_name
-    shutil.copy2(best, destination)
-    return destination
+    return best
+
+
+def resolve_device(requested: str) -> str:
+    if requested.lower() != "auto":
+        return requested
+    import torch
+
+    return "0" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_workers(requested: str, device: str) -> int:
+    if requested.lower() != "auto":
+        workers = int(requested)
+        if workers < 0:
+            raise ValueError("--workers must be zero or greater")
+        return workers
+    logical_cores = os.cpu_count() or 2
+    divisor = 4 if device == "cpu" else 2
+    return min(8, max(0 if device == "cpu" else 2, logical_cores // divisor))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the two private Aadhaar masking models.")
     parser.add_argument("--task", choices=("documents", "numbers", "all"), default="all")
-    parser.add_argument("--device", default="0", help="CUDA device such as 0, or cpu")
+    parser.add_argument("--device", default="auto", help="auto, a CUDA device such as 0, or cpu")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", default="auto", help="Data-loader workers, or auto")
+    parser.add_argument("--cache", choices=("none", "ram", "disk"), default="none")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic kernels at some speed cost")
     parser.add_argument("--patience", type=int, default=35)
     parser.add_argument("--freeze", type=int, default=0, help="Freeze the first N model layers; useful for CPU bootstrap training.")
     parser.add_argument("--document-imgsz", type=int, default=1280)
@@ -106,6 +128,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    device = resolve_device(args.device)
+    workers = resolve_workers(args.workers, device)
     outputs: list[Path] = []
     if args.task in {"documents", "all"}:
         outputs.append(
@@ -113,14 +137,15 @@ def main() -> None:
                 base_model=args.document_base,
                 dataset=args.document_data.resolve(),
                 run_name="aadhaar-document-seg",
-                output_name="aadhaar-document-seg.pt",
                 epochs=args.epochs,
                 image_size=args.document_imgsz,
                 batch=args.batch,
-                device=args.device,
-                workers=args.workers,
+                device=device,
+                workers=workers,
                 patience=args.patience,
                 freeze=args.freeze,
+                cache=args.cache,
+                deterministic=args.deterministic,
                 degrees=180.0,
                 translate=0.12,
                 scale=0.45,
@@ -134,14 +159,15 @@ def main() -> None:
                 base_model=args.number_base,
                 dataset=args.number_data.resolve(),
                 run_name="aadhaar-number-det",
-                output_name="aadhaar-number-det.pt",
                 epochs=args.epochs,
                 image_size=args.number_imgsz,
                 batch=args.batch,
-                device=args.device,
-                workers=args.workers,
+                device=device,
+                workers=workers,
                 patience=args.patience,
                 freeze=args.freeze,
+                cache=args.cache,
+                deterministic=args.deterministic,
                 # The number detector sees an already-rectified document. Keep
                 # text large and nearly upright instead of applying the scene-
                 # level segmentation recipe to small printed digits.
@@ -153,7 +179,7 @@ def main() -> None:
             )
         )
     for output in outputs:
-        print(f"Deployed reviewed checkpoint: {output}")
+        print(f"Candidate checkpoint for review: {output}")
 
 
 if __name__ == "__main__":

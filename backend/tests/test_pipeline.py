@@ -50,6 +50,29 @@ class EmptyDocumentProposer:
         return []
 
 
+class OnePaymentCardProposer:
+    def detect(self, image):
+        height, width = image.shape[:2]
+        polygon = np.array(
+            [[80, 80], [width - 81, 80], [width - 81, height - 81], [80, height - 81]],
+            dtype=np.float32,
+        )
+        return [
+            VisionDetection(
+                class_name="aadhaar_front",
+                confidence=0.55,
+                polygon=polygon,
+                box=np.array([80, 80, width - 81, height - 81], dtype=np.float32),
+                source="opencv_proposal",
+            )
+        ]
+
+
+class NumberDetectorMustNotRun:
+    def detect(self, _image):
+        raise AssertionError("Payment-card input must be rejected before Aadhaar number detection")
+
+
 def settings() -> Settings:
     return Settings(
         document_model_path=Path("document.pt"),
@@ -157,6 +180,34 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(NoAadhaarDetected):
             pipeline.process([image])
 
+    @patch("backend.pipeline.read_ocr_lines")
+    def test_credit_card_candidate_is_rejected_after_one_ocr_pass(self, mocked_ocr) -> None:
+        mocked_ocr.return_value = [
+            OcrLine(
+                text="VISA CREDIT CARD",
+                confidence=0.99,
+                polygon=np.array([[100, 100], [300, 100], [300, 130], [100, 130]], dtype=np.float32),
+            ),
+            OcrLine(
+                text="4111 1111 1111 1111",
+                confidence=0.99,
+                polygon=np.array([[100, 300], [700, 300], [700, 350], [100, 350]], dtype=np.float32),
+            ),
+        ]
+        pipeline = AadhaarPipeline(
+            EmptyDocumentSegmenter(),
+            NumberDetectorMustNotRun(),
+            object(),
+            settings(),
+            document_proposer=OnePaymentCardProposer(),
+        )
+        image = np.random.default_rng(17).integers(60, 235, (500, 800, 3), dtype=np.uint8)
+
+        with self.assertRaises(NoAadhaarDetected):
+            pipeline.process([image])
+
+        self.assertEqual(mocked_ocr.call_count, 1)
+
     @patch("backend.pipeline.qr_present", return_value=False)
     @patch("backend.pipeline.read_ocr_lines")
     def test_verified_aadhaar_is_cropped_and_masked(self, mocked_ocr, _mocked_qr) -> None:
@@ -223,6 +274,29 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(result.documents), 1)
         self.assertEqual(result.masked_regions, 2)
+
+    @patch("backend.pipeline.qr_present", return_value=False)
+    @patch("backend.pipeline.read_ocr_lines")
+    def test_discarded_broad_candidate_does_not_run_a_redundant_audit(
+        self, mocked_ocr, _mocked_qr
+    ) -> None:
+        mocked_ocr.side_effect = [ocr_lines(), [], ocr_lines()]
+        pipeline = AadhaarPipeline(
+            OneDocumentSegmenter(),
+            OneNumberDetector(),
+            object(),
+            settings(),
+            document_proposer=EmptyDocumentProposer(),
+        )
+        image = np.random.default_rng(29).integers(60, 235, (500, 800, 3), dtype=np.uint8)
+
+        result = pipeline.process([image])
+
+        self.assertEqual(len(result.documents), 1)
+        self.assertEqual(result.masked_regions, 1)
+        # Candidate OCR + selected crop audit + full-page comparison OCR.
+        # The comparison is discarded, so it does not need a post-mask audit.
+        self.assertEqual(mocked_ocr.call_count, 3)
 
     @patch("backend.pipeline.qr_present", return_value=False)
     @patch("backend.pipeline.read_ocr_lines")

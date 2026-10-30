@@ -15,21 +15,16 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .configuration import load_project_environment
 
 load_project_environment()
 
 from . import cloudflare_kv
-from .ai_summary import (
-    CardSummaryRequest,
-    confidence_evidence_for_result,
-    confidence_score,
-    pipeline_confidence_score,
-    summarize_card_result,
-)
 from .batches import (
     SUPPORTED_EXTENSIONS,
+    BatchQueueFull,
     BatchManager,
     BatchSeed,
     resolve_input_folder,
@@ -46,6 +41,7 @@ from .documents import input_pages, make_flattened_pdf
 from .errors import ModelNotReady, PipelineError
 from .ocr import configure_cpu_threads, load_ocr_engine
 from .pipeline import AadhaarPipeline
+from .security import ApiKeyMiddleware, api_key_required, configured_api_key, validate_api_key_configuration
 from .settings import Settings
 
 
@@ -65,10 +61,17 @@ class S3BatchRequest(BaseModel):
     relative_prefix: str = Field(default="", max_length=512)
 
 
-def require_batch_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    expected = os.getenv("AADHAAR_BATCH_API_KEY", "").strip()
-    if expected and (not x_api_key or not hmac.compare_digest(x_api_key, expected)):
-        raise HTTPException(status_code=401, detail="A valid X-API-Key header is required.")
+def require_batch_api_key(
+    x_api_key: Optional[str] = Header(default=None),
+    x_batch_api_key: Optional[str] = Header(default=None),
+) -> None:
+    expected_batch = os.getenv("AADHAAR_BATCH_API_KEY", "").strip()
+    if expected_batch:
+        # Keep backwards compatibility when both keys are the same; when they
+        # differ, a trusted gateway can inject X-Batch-API-Key separately.
+        supplied_batch = x_batch_api_key or x_api_key
+        if not supplied_batch or not hmac.compare_digest(supplied_batch, expected_batch):
+            raise HTTPException(status_code=401, detail="A valid batch API key is required.")
 
 
 def serialize_batch(manager: BatchManager, batch_id: str) -> dict[str, Any]:
@@ -80,6 +83,7 @@ def serialize_batch(manager: BatchManager, batch_id: str) -> dict[str, Any]:
     for item in result["files"]:
         output_path = item.get("output_path")
         has_local_output = bool(output_path and Path(output_path).is_file())
+        has_remote_output = bool(item.get("output_s3_uri"))
         files.append({
             "file_id": item["id"],
             "file_name": item["display_name"],
@@ -89,13 +93,11 @@ def serialize_batch(manager: BatchManager, batch_id: str) -> dict[str, Any]:
             "document_count": item["document_count"],
             "document_classes": json.loads(item["document_classes"] or "[]"),
             "masked_regions": item["masked_regions"],
-            "masking_confidence": item["masking_confidence"],
-            "masking_confidence_source": item["masking_confidence_source"],
             "output_s3_uri": item["output_s3_uri"],
             "output_storage_uri": item["output_s3_uri"],
             "download_url": (
                 f"/api/batches/{batch_id}/files/{item['id']}/download"
-                if has_local_output
+                if has_local_output or has_remote_output
                 else None
             ),
         })
@@ -115,6 +117,20 @@ def serialize_batch(manager: BatchManager, batch_id: str) -> dict[str, Any]:
     }
 
 
+async def _serialize_batch_response(manager: BatchManager, batch_id: str) -> dict[str, Any]:
+    return await run_in_threadpool(serialize_batch, manager, batch_id)
+
+
+async def _create_batch_record(manager: BatchManager, batch_id: str, source_type: str, seeds: list[BatchSeed]) -> None:
+    try:
+        await run_in_threadpool(manager.create_batch, batch_id, source_type, seeds)
+    except BatchQueueFull as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="The batch queue is full. Wait for current files to finish before submitting another batch.",
+        ) from exc
+
+
 async def _process_batch_input(
     path: Path,
     display_name: str,
@@ -131,26 +147,10 @@ async def _process_batch_input(
     result = await run_in_threadpool(_process_serial, pipeline, pages)
     flattened_pdf = await run_in_threadpool(make_flattened_pdf, result.documents)
     classes = sorted({document.document_class for document in result.documents})
-    minimum_document_confidence = min(document.document_confidence for document in result.documents)
-    minimum_verification_confidence = min(document.verification_confidence for document in result.documents)
-    document_evidence = confidence_evidence_for_result(result, settings.min_blur_score)
-    score_request = CardSummaryRequest(
-        outcome="success",
-        document_count=len(result.documents),
-        masked_regions=result.masked_regions,
-        document_classes=classes,
-        document_confidence=minimum_document_confidence,
-        verification_confidence=minimum_verification_confidence,
-        pipeline_score=pipeline_confidence_score(result),
-        document_evidence=document_evidence,
-    )
-    confidence_assessment = await run_in_threadpool(summarize_card_result, score_request)
     return flattened_pdf, {
         "document_count": len(result.documents),
         "document_classes": classes,
         "masked_regions": result.masked_regions,
-        "masking_confidence": confidence_assessment["confidence_score"],
-        "masking_confidence_source": confidence_assessment["confidence_source"],
     }
 
 
@@ -174,7 +174,7 @@ def _load_pipeline(settings: Settings) -> AadhaarPipeline:
         image_size=settings.inference_size,
         fallback_confidence=settings.number_fallback_confidence,
     )
-    ocr_engine = load_ocr_engine()
+    ocr_engine = load_ocr_engine(settings.ocr_device)
     return AadhaarPipeline(
         document_segmenter,
         number_detector,
@@ -186,6 +186,7 @@ def _load_pipeline(settings: Settings) -> AadhaarPipeline:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_api_key_configuration()
     settings = Settings.from_environment()
     app.state.settings = settings
     app.state.pipeline = None
@@ -222,15 +223,22 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         batch_manager.request_stop()
-        await batch_worker
-        if not task.done():
-            task.cancel()
+        try:
+            await batch_worker
+        finally:
+            if not task.done():
+                task.cancel()
+            batch_manager.close()
 
 
 app = FastAPI(
     title="Private Aadhaar masking processor",
     version="1.0.0",
     lifespan=lifespan,
+)
+app.add_middleware(
+    ApiKeyMiddleware,
+    expected_key=configured_api_key() if api_key_required() else "",
 )
 
 
@@ -246,16 +254,19 @@ async def health() -> dict[str, Any]:
             "document_detector": {
                 "ready": settings.document_model_path.is_file(),
                 "type": "YOLO instance segmentation",
+                "device": settings.yolo_device,
                 "weight": settings.document_model_path.name,
             },
             "number_detector": {
                 "ready": settings.number_model_path.is_file(),
                 "type": "YOLO object detection",
+                "device": settings.yolo_device,
                 "weight": settings.number_model_path.name,
             },
             "ocr": {
                 "ready": app.state.pipeline is not None,
                 "type": "PaddleOCR word-position OCR",
+                "device": settings.ocr_device,
             },
             "geometric_fallback": {
                 "ready": app.state.pipeline is not None,
@@ -268,11 +279,6 @@ async def health() -> dict[str, Any]:
             and cloudflare_kv.prefixes_are_separate(),
         },
     }
-
-
-@app.post("/api/card-summary")
-async def card_summary(request: CardSummaryRequest) -> dict[str, Any]:
-    return await run_in_threadpool(summarize_card_result, request)
 
 
 def _process_serial(pipeline: AadhaarPipeline, pages: list[Any]):
@@ -306,29 +312,6 @@ async def process_document(file: UploadFile = File(...)) -> Response:
         content = b""
 
     classes = sorted({document.document_class for document in result.documents})
-    minimum_document_confidence = min(document.document_confidence for document in result.documents)
-    minimum_verification_confidence = min(document.verification_confidence for document in result.documents)
-    minimum_boundary_confidence = min(document.boundary_confidence for document in result.documents)
-    minimum_scan_quality = min(document.scan_quality_score for document in result.documents)
-    minimum_ocr_confidence = min(document.ocr_confidence for document in result.documents)
-    number_detector_scores = [
-        document.number_detector_confidence
-        for document in result.documents
-        if document.number_detector_confidence is not None
-    ]
-    minimum_number_detector_confidence = min(number_detector_scores) if number_detector_scores else None
-    pipeline_score = pipeline_confidence_score(result)
-    document_evidence = confidence_evidence_for_result(result, settings.min_blur_score)
-    score_request = CardSummaryRequest(
-        outcome="success",
-        document_count=len(result.documents),
-        masked_regions=result.masked_regions,
-        document_classes=classes,
-        document_confidence=minimum_document_confidence,
-        verification_confidence=minimum_verification_confidence,
-        pipeline_score=pipeline_score,
-        document_evidence=document_evidence,
-    )
     return Response(
         content=flattened_pdf,
         media_type="application/pdf",
@@ -337,18 +320,6 @@ async def process_document(file: UploadFile = File(...)) -> Response:
             "X-Aadhaar-Documents": str(len(result.documents)),
             "X-Redacted-Regions": str(result.masked_regions),
             "X-Document-Classes": ",".join(classes),
-            "X-Document-Confidence": f"{minimum_document_confidence:.3f}",
-            "X-Boundary-Confidence": f"{minimum_boundary_confidence:.3f}",
-            "X-Scan-Quality-Score": f"{minimum_scan_quality:.3f}",
-            "X-OCR-Confidence": f"{minimum_ocr_confidence:.3f}",
-            "X-Verification-Confidence": f"{minimum_verification_confidence:.3f}",
-            "X-Number-Localization-Confidence": (
-                f"{minimum_number_detector_confidence:.3f}"
-                if minimum_number_detector_confidence is not None
-                else "not_matched"
-            ),
-            "X-Masking-Confidence": str(confidence_score(score_request)),
-            "X-Confidence-Evidence": json.dumps(document_evidence, separators=(",", ":")),
             "Cache-Control": "no-store, private",
             "Pragma": "no-cache",
             "X-Content-Type-Options": "nosniff",
@@ -362,11 +333,12 @@ def _require_pipeline() -> None:
         raise HTTPException(error.status_code, error.detail())
 
 
-def _check_batch_capacity(manager: BatchManager, queued_files: int) -> None:
-    if manager.pending_count() + queued_files > manager.max_pending:
+async def _check_batch_capacity(manager: BatchManager, queued_files: int) -> None:
+    pending = await run_in_threadpool(manager.pending_count)
+    if pending + queued_files > manager.max_pending:
         raise HTTPException(
             status_code=429,
-            detail="The CPU batch queue is full. Wait for current files to finish before submitting another batch.",
+            detail="The batch queue is full. Wait for current files to finish before submitting another batch.",
         )
 
 
@@ -383,21 +355,36 @@ def _file_result_response(manager: BatchManager, batch_id: str, file_id: str) ->
     if item is None or item["batch_id"] != batch_id:
         raise HTTPException(status_code=404, detail="Batch file not found.")
     output_path = item.get("output_path")
-    if not output_path or not Path(output_path).is_file():
-        if item["status"] in {"queued", "processing"}:
-            raise HTTPException(status_code=409, detail="This file is still processing.")
+    local_output = Path(output_path) if output_path and Path(output_path).is_file() else None
+    if local_output is None and item["status"] in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="This file is still processing.")
+    temporary_output: Path | None = None
+    if local_output is None and item.get("output_s3_uri"):
+        temporary_output = manager.storage_root / "downloads" / f"{file_id}-{manager.new_id()}.pdf"
+        try:
+            manager.materialize_output(item["output_s3_uri"], temporary_output)
+        except Exception as exc:
+            temporary_output.unlink(missing_ok=True)
+            raise HTTPException(status_code=502, detail="The masked output could not be retrieved from shared storage.") from exc
+        local_output = temporary_output
+    if local_output is None:
         raise HTTPException(status_code=404, detail="No masked PDF was created for this file.")
     return FileResponse(
-        output_path,
+        local_output,
         media_type="application/pdf",
         filename=f"masked-{file_id}.pdf",
         headers={"Cache-Control": "no-store, private", "X-Content-Type-Options": "nosniff"},
+        background=(
+            BackgroundTask(lambda: temporary_output.unlink(missing_ok=True))
+            if temporary_output is not None
+            else None
+        ),
     )
 
 
 @app.post("/api/batches", status_code=202, dependencies=[Depends(require_batch_api_key)])
 async def create_upload_batch(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """Queue a batch of uploaded PDFs/images; each input is processed on CPU, one at a time."""
+    """Queue uploaded files for the configured inference workers."""
     try:
         _require_pipeline()
         manager: BatchManager = app.state.batch_manager
@@ -406,8 +393,7 @@ async def create_upload_batch(files: list[UploadFile] = File(...)) -> dict[str, 
             raise HTTPException(status_code=400, detail="Choose at least one supported file.")
         if len(files) > manager.max_files:
             raise HTTPException(status_code=413, detail=f"A batch may contain at most {manager.max_files} files.")
-        _check_batch_capacity(manager, len(files))
-
+        await _check_batch_capacity(manager, len(files))
         prepared: list[tuple[UploadFile, str, str]] = []
         for uploaded in files:
             display_name = safe_display_name(uploaded.filename)
@@ -419,6 +405,7 @@ async def create_upload_batch(files: list[UploadFile] = File(...)) -> dict[str, 
         batch_id = manager.new_id()
         manager.prepare_batch_dir(batch_id)
         seeds: list[BatchSeed] = []
+        uploaded_shared_keys: list[str] = []
         batch_bytes = 0
         try:
             for uploaded, display_name, suffix in prepared:
@@ -436,19 +423,46 @@ async def create_upload_batch(files: list[UploadFile] = File(...)) -> dict[str, 
                         output.write(chunk)
                 if file_bytes == 0:
                     raise HTTPException(status_code=400, detail="Empty files cannot be processed.")
-                seeds.append(BatchSeed(
-                    file_id=file_id,
-                    display_name=display_name,
-                    source_type="upload",
-                    input_path=str(destination),
-                    source_size=file_bytes,
-                ))
-            manager.create_batch(batch_id, "upload", seeds)
+                try:
+                    shared = await run_in_threadpool(
+                        manager.store_shared_input,
+                        batch_id,
+                        file_id,
+                        suffix,
+                        destination,
+                        mimetypes.guess_type(display_name)[0] or "application/octet-stream",
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail="Could not store this source file in shared storage.") from exc
+                if shared is None:
+                    seeds.append(BatchSeed(
+                        file_id=file_id,
+                        display_name=display_name,
+                        source_type="upload",
+                        input_path=str(destination),
+                        source_size=file_bytes,
+                    ))
+                else:
+                    uploaded_shared_keys.append(f"s3://{shared['source_bucket']}/{shared['source_key']}")
+                    destination.unlink(missing_ok=True)
+                    seeds.append(BatchSeed(
+                        file_id=file_id,
+                        display_name=display_name,
+                        source_type=shared["source_type"],
+                        source_bucket=shared["source_bucket"],
+                        source_key=shared["source_key"],
+                        source_size=shared["source_size"],
+                    ))
+            await _create_batch_record(manager, batch_id, "upload", seeds)
         except Exception:
             manager.discard_workspace(batch_id)
+            if uploaded_shared_keys:
+                try:
+                    await run_in_threadpool(manager.delete_s3_outputs, uploaded_shared_keys)
+                except Exception:
+                    pass
             raise
-        await manager.submit(batch_id)
-        return serialize_batch(manager, batch_id)
+        return await _serialize_batch_response(manager, batch_id)
     finally:
         for uploaded in files:
             await uploaded.close()
@@ -456,7 +470,7 @@ async def create_upload_batch(files: list[UploadFile] = File(...)) -> dict[str, 
 
 @app.post("/api/batches/folder", status_code=202, dependencies=[Depends(require_batch_api_key)])
 async def create_folder_batch(request: FolderBatchRequest) -> dict[str, Any]:
-    """Copy supported files from a configured input folder into a CPU batch."""
+    """Copy supported files from a configured input folder into a local batch."""
     _require_pipeline()
     manager: BatchManager = app.state.batch_manager
     settings: Settings = app.state.settings
@@ -476,11 +490,12 @@ async def create_folder_batch(request: FolderBatchRequest) -> dict[str, Any]:
     if accepted_size > manager.max_total_bytes:
         raise HTTPException(status_code=413, detail="The folder batch exceeds the configured total upload size limit.")
     queued_count = sum(path.stat().st_size <= settings.max_upload_bytes for path in sources)
-    _check_batch_capacity(manager, queued_count)
+    await _check_batch_capacity(manager, queued_count)
 
     batch_id = manager.new_id()
     manager.prepare_batch_dir(batch_id)
     seeds: list[BatchSeed] = []
+    uploaded_shared_keys: list[str] = []
     try:
         for source in sources:
             file_id = manager.new_id()
@@ -499,19 +514,46 @@ async def create_folder_batch(request: FolderBatchRequest) -> dict[str, Any]:
                 continue
             staged = manager.staged_path(batch_id, file_id, source.suffix.lower())
             await run_in_threadpool(shutil.copyfile, source, staged)
-            seeds.append(BatchSeed(
-                file_id=file_id,
-                display_name=display_name,
-                source_type="folder",
-                input_path=str(staged),
-                source_size=size,
-            ))
-        manager.create_batch(batch_id, "folder", seeds)
+            try:
+                shared = await run_in_threadpool(
+                    manager.store_shared_input,
+                    batch_id,
+                    file_id,
+                    source.suffix.lower(),
+                    staged,
+                    mimetypes.guess_type(display_name)[0] or "application/octet-stream",
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="Could not store this source file in shared storage.") from exc
+            if shared is None:
+                seeds.append(BatchSeed(
+                    file_id=file_id,
+                    display_name=display_name,
+                    source_type="folder",
+                    input_path=str(staged),
+                    source_size=size,
+                ))
+            else:
+                uploaded_shared_keys.append(f"s3://{shared['source_bucket']}/{shared['source_key']}")
+                staged.unlink(missing_ok=True)
+                seeds.append(BatchSeed(
+                    file_id=file_id,
+                    display_name=display_name,
+                    source_type=shared["source_type"],
+                    source_bucket=shared["source_bucket"],
+                    source_key=shared["source_key"],
+                    source_size=shared["source_size"],
+                ))
+        await _create_batch_record(manager, batch_id, "folder", seeds)
     except Exception:
         manager.discard_workspace(batch_id)
+        if uploaded_shared_keys:
+            try:
+                await run_in_threadpool(manager.delete_s3_outputs, uploaded_shared_keys)
+            except Exception:
+                pass
         raise
-    await manager.submit(batch_id)
-    return serialize_batch(manager, batch_id)
+    return await _serialize_batch_response(manager, batch_id)
 
 
 @app.post("/api/batches/r2", status_code=202, dependencies=[Depends(require_batch_api_key)])
@@ -560,7 +602,7 @@ async def create_s3_batch(request: S3BatchRequest) -> dict[str, Any]:
     if total_bytes > manager.max_total_bytes:
         raise HTTPException(status_code=413, detail="The S3 batch exceeds the configured total upload size limit.")
     queued_count = sum(item["size"] <= settings.max_upload_bytes for item in objects)
-    _check_batch_capacity(manager, queued_count)
+    await _check_batch_capacity(manager, queued_count)
 
     source_type = "r2" if bucket == r2_bucket and r2_bucket else "s3"
     batch_id = manager.new_id()
@@ -591,12 +633,11 @@ async def create_s3_batch(request: S3BatchRequest) -> dict[str, Any]:
                 source_size=item["size"],
             ))
     try:
-        manager.create_batch(batch_id, source_type, seeds)
+        await _create_batch_record(manager, batch_id, source_type, seeds)
     except Exception:
         manager.discard_workspace(batch_id)
         raise
-    await manager.submit(batch_id)
-    return serialize_batch(manager, batch_id)
+    return await _serialize_batch_response(manager, batch_id)
 
 
 @app.post("/api/batches/r2/upload-folder", status_code=202, dependencies=[Depends(require_batch_api_key)])
@@ -644,7 +685,7 @@ async def upload_local_folder_to_r2(request: FolderBatchRequest) -> dict[str, An
     valid_sources = [path for path in sources if path.stat().st_size <= settings.max_upload_bytes]
     if sum(path.stat().st_size for path in valid_sources) > manager.max_total_bytes:
         raise HTTPException(status_code=413, detail="The folder exceeds the configured total upload size limit.")
-    _check_batch_capacity(manager, len(valid_sources))
+    await _check_batch_capacity(manager, len(valid_sources))
 
     batch_id = manager.new_id()
     manager.prepare_batch_dir(batch_id)
@@ -699,7 +740,7 @@ async def upload_local_folder_to_r2(request: FolderBatchRequest) -> dict[str, An
                 source_key=object_key,
                 source_size=actual_size,
             ))
-        manager.create_batch(batch_id, "r2_upload", seeds)
+        await _create_batch_record(manager, batch_id, "r2_upload", seeds)
     except Exception:
         manager.discard_workspace(batch_id)
         if uploaded_keys:
@@ -712,8 +753,7 @@ async def upload_local_folder_to_r2(request: FolderBatchRequest) -> dict[str, An
                 pass
         raise
 
-    await manager.submit(batch_id)
-    return serialize_batch(manager, batch_id)
+    return await _serialize_batch_response(manager, batch_id)
 
 
 def _require_workers_kv() -> None:
@@ -752,7 +792,7 @@ async def upload_local_folder_to_workers_kv(request: FolderBatchRequest) -> dict
     accepted = [path for path in sources if path.stat().st_size <= settings.max_upload_bytes]
     if sum(path.stat().st_size for path in accepted) > manager.max_total_bytes:
         raise HTTPException(status_code=413, detail="The folder exceeds the configured total upload size limit.")
-    _check_batch_capacity(manager, len(accepted))
+    await _check_batch_capacity(manager, len(accepted))
 
     batch_id = manager.new_id()
     manager.prepare_batch_dir(batch_id)
@@ -801,7 +841,7 @@ async def upload_local_folder_to_workers_kv(request: FolderBatchRequest) -> dict
                 source_size=actual_size,
             ))
 
-        manager.create_batch(batch_id, "workers_kv_upload", seeds)
+        await _create_batch_record(manager, batch_id, "workers_kv_upload", seeds)
     except Exception:
         manager.discard_workspace(batch_id)
         for key in uploaded_keys:
@@ -811,8 +851,7 @@ async def upload_local_folder_to_workers_kv(request: FolderBatchRequest) -> dict
                 pass
         raise
 
-    await manager.submit(batch_id)
-    return serialize_batch(manager, batch_id)
+    return await _serialize_batch_response(manager, batch_id)
 
 
 @app.post("/api/batches/kv/store-folder", status_code=201, dependencies=[Depends(require_batch_api_key)])
@@ -903,7 +942,7 @@ async def create_workers_kv_batch(request: S3BatchRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="No supported files were found under the Workers KV inbox prefix.")
     if len(key_records) > manager.max_files:
         raise HTTPException(status_code=413, detail=f"A batch may contain at most {manager.max_files} files.")
-    _check_batch_capacity(manager, len(key_records))
+    await _check_batch_capacity(manager, len(key_records))
 
     batch_id = manager.new_id()
     manager.prepare_batch_dir(batch_id)
@@ -949,25 +988,24 @@ async def create_workers_kv_batch(request: S3BatchRequest) -> dict[str, Any]:
                 source_key=key,
                 source_size=size,
             ))
-        manager.create_batch(batch_id, "workers_kv", seeds)
+        await _create_batch_record(manager, batch_id, "workers_kv", seeds)
     except Exception:
         manager.discard_workspace(batch_id)
         raise
 
-    await manager.submit(batch_id)
-    return serialize_batch(manager, batch_id)
+    return await _serialize_batch_response(manager, batch_id)
 
 
 @app.get("/api/batches/{batch_id}", dependencies=[Depends(require_batch_api_key)])
 async def get_batch_status(batch_id: str) -> dict[str, Any]:
-    return serialize_batch(app.state.batch_manager, batch_id)
+    return await _serialize_batch_response(app.state.batch_manager, batch_id)
 
 
 @app.get("/api/batches/{batch_id}/files/{file_id}/download", dependencies=[Depends(require_batch_api_key)])
 async def download_batch_file(batch_id: str, file_id: str) -> FileResponse:
     manager: BatchManager = app.state.batch_manager
     try:
-        return _file_result_response(manager, batch_id, file_id)
+        return await run_in_threadpool(_file_result_response, manager, batch_id, file_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid batch or file identifier.") from exc
 
@@ -989,6 +1027,7 @@ async def download_batch_archive(batch_id: str) -> FileResponse:
         media_type="application/zip",
         filename=f"masked-batch-{batch_id}.zip",
         headers={"Cache-Control": "no-store, private", "X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(lambda: archive.unlink(missing_ok=True)),
     )
 
 
@@ -1000,7 +1039,7 @@ async def delete_batch(batch_id: str) -> Response:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid batch identifier.") from exc
     try:
-        deleted = manager.delete_batch(batch_id)
+        deleted = await run_in_threadpool(manager.delete_batch, batch_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
